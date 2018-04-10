@@ -219,6 +219,8 @@ def create_dict_from_ref_list(options, ref_list, keys, tags):
 def get_references_from_file(path, filename):
     options = config.setting
     composer_dict_list = []
+    period_dict_list = []
+    genre_dict_list = []
     try:
         xml_file = open(os.path.join(path, filename))
         reply = xml_file.read()
@@ -6178,11 +6180,11 @@ class PartLevels():
                 if '~cwp_workid_' + unicode(lev) in tm:
                     tup_id = interpret(tm['~cwp_workid_' + unicode(lev)])
                     if 'annotations' in self.parts[tup_id]:
-                        tm['~cwp_work_' + unicode(lev)] += "; (" + ', '.join(self.parts[tup_id]['annotations']) + ")"
+                        tm['~cwp_work_' + unicode(lev)] += " (" + ', '.join(self.parts[tup_id]['annotations']) + ")"
                         if lev < part_levels:
                             if 'stripped_annotations' in self.parts[tup_id]:
                                 if self.parts[tup_id]['stripped_annotations']:
-                                    tm['~cwp_part_' + unicode(lev)] += "; (" + ', '.join(
+                                    tm['~cwp_part_' + unicode(lev)] += " (" + ', '.join(
                                         self.parts[tup_id]['stripped_annotations']) + ")"
 
 
