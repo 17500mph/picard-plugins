@@ -56,7 +56,7 @@ See the readme file for full details
 #
 # The main control routine is at the end of the module
 
-PLUGIN_VERSION = '0.9.1'
+PLUGIN_VERSION = '0.9.2'
 PLUGIN_API_VERSIONS = ["1.4.0", "1.4.2"]
 PLUGIN_LICENSE = "GPL-2.0"
 PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
@@ -65,30 +65,196 @@ from picard.ui.options import register_options_page, OptionsPage
 from picard.plugins.classical_extras.ui_options_classical_extras import Ui_ClassicalExtrasOptionsPage
 from picard import config, log
 from picard.config import ConfigSection, BoolOption, IntOption, TextOption
-from picard.util import LockableObject
+from picard.util import LockableObject, uniqify
 
 # note that in 2.0 picard.webservice will change to picard.util.xml
 from picard.webservice import XmlNode
 from picard.metadata import register_track_metadata_processor, Metadata
 from functools import partial
+from datetime import datetime
 import collections
 import re
 import unicodedata
 # import traceback
 import json
 import copy
+import os
+from PyQt4.QtCore import QXmlStreamReader
+from picard.file import File
+from picard.track import Track
+from picard.tagger import Tagger
+from itertools import chain
+
 
 ##########################
 # MODULE-WIDE COMPONENTS #
 ##########################
 
 # CONSTANTS
+_node_name_re = re.compile('[^a-zA-Z0-9]')
+
+def _node_name(n):
+    return _node_name_re.sub('_', unicode(n))
+
+def _read_xml(stream):
+    document = XmlNode()
+    current_node = document
+    path = []
+
+    while not stream.atEnd():
+        stream.readNext()
+
+        if stream.isStartElement():
+            node = XmlNode()
+            attrs = stream.attributes()
+
+            for i in xrange(attrs.count()):
+                attr = attrs.at(i)
+                node.attribs[_node_name(attr.name())] = unicode(attr.value())
+
+            current_node.append_child(_node_name(stream.name()), node)
+            path.append(current_node)
+            current_node = node
+
+        elif stream.isEndElement():
+            current_node = path.pop()
+
+        elif stream.isCharacters():
+            current_node.text += unicode(stream.text())
+
+    return document
+
+
+def parse_data(options, obj, response_list, *match):
+    """
+    :param options:
+    :param obj: an XmlNode object, list or dictionary containing nodes
+    :param response_list: working memory for recursive calls
+    :param match: list of items to search for in node (see detailed notes below
+    :return: a list of matching items (always a list, even if only one item)
+    This function takes any XmlNode object, or list thereof,
+    and extracts a list of all objects exactly matching the hierarchy listed in match
+    match should contain list of each node in hierarchical sequence, with no gaps in the sequence
+     of nodes, to lowest level required.
+    Insert attribs.attribname:attribvalue in the list to select only branches where attribname
+     is attribvalue.
+    Insert childname.text:childtext in the list to select only branches where
+     a sibling with childname has text childtext.
+      (Note: childname can be a dot-list if the text is more than one level down - e.g. child1.child2)
+      # TODO - Check this works fully
+    """
+
+    DEBUG = False  # options["log_debug"]
+    INFO = False  # options["log_info"]
+    # Over-ridden options as these can be VERY wordy
+
+    # XmlNode instances are not iterable, so need to convert to dict
+    if isinstance(obj, XmlNode):
+        obj = obj.__dict__
+    if DEBUG:
+        log.debug('%s: parsing data - looking for %s', PLUGIN_NAME, match)
+    if INFO:
+        log.info('looking in %s', obj)
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, XmlNode):
+                item = item.__dict__
+            parse_data(options, item, response_list, *match)
+        if INFO:
+            log.info('response_list: %s', response_list)
+        return response_list
+    elif isinstance(obj, dict):
+        if match[0] in obj:
+            if len(match) == 1:
+                response = obj[match[0]]
+                response_list.append(response)
+            else:
+                match_list = list(match)
+                match_list.pop(0)
+                parse_data(
+                    options, obj[match[0]], response_list, *match_list)
+            if INFO:
+                log.info('response_list: %s', response_list)
+            return response_list
+        elif '.' in match[0]:
+            test = match[0].split(':')
+            match2 = test[0].split('.')
+            test_data = parse_data(options, obj, [], *match2)
+            if len(test) > 1:
+                if test[1] in test_data:
+                    if len(match) == 1:
+                        response = obj
+                        response_list.append(response)
+                    else:
+                        match_list = list(match)
+                        match_list.pop(0)
+                        parse_data(
+                            options, obj, response_list, *match_list)
+            else:
+                parse_data(options, obj, response_list, *match2)
+            if INFO:
+                log.info('response_list: %s', response_list)
+            return response_list
+        else:
+            if 'children' in obj:
+                parse_data(
+                    options, obj['children'], response_list, *match)
+            if INFO:
+                log.info('response_list: %s', response_list)
+            return response_list
+    else:
+        if INFO:
+            log.info('response_list: %s', response_list)
+        return response_list
+
+def create_dict_from_ref_list(options, ref_list, keys, tags):
+    ref_dict_list = []
+    for refs in ref_list:
+        for ref in refs:
+            parsed_refs = [parse_data(options, ref, [], t, 'text') for t in tags]
+            ref_dict_list.append(dict(zip(keys, parsed_refs)))
+    return ref_dict_list
+
+
+def get_references_from_file(path, filename):
+    options = config.setting
+    composer_dict_list = []
+    try:
+        xml_file = open(os.path.join(path, filename))
+        reply = xml_file.read()
+        xml_file.close()
+        document = _read_xml(QXmlStreamReader(reply))
+        # Composers
+        composer_list = parse_data(options, document, [], 'ReferenceDB', 'Composer')
+        keys = ['name', 'sort', 'birth', 'death', 'country', 'core']
+        tags = ['Name', 'Sort', 'Birth', 'Death', 'CountryCode', 'Core']
+        composer_dict_list = create_dict_from_ref_list(options, composer_list, keys, tags)
+        # Periods
+        period_list = parse_data(options, document, [], 'ReferenceDB', 'ClassicalPeriod')
+        keys = ['name', 'start', 'end']
+        tags = ['Name', 'Start_x0020_Date', 'End_x0020_Date']
+        period_dict_list = create_dict_from_ref_list(options, period_list, keys, tags)
+        # Genres
+        genre_list = parse_data(options, document, [], 'ReferenceDB', 'ClassicalGenre')
+        keys = ['name']
+        tags = ['Name']
+        genre_dict_list = create_dict_from_ref_list(options, genre_list, keys, tags)
+
+    except IOError:
+        if options['cwp_muso_genres'] or options['cwp_muso_classical'] or options['cwp_muso_dates'] or options['cwp_muso_periods']:
+            log.error('File %s does not exist or is corrupted', os.path.join(path, file))
+    finally:
+        return {'composers': composer_dict_list, 'periods': period_dict_list, 'genres': genre_dict_list}
+
+
+
 
 prefixes = ['the', 'a', 'an', 'le', 'la', 'les', 'los', 'il']
 
 PRESERVE = [x.strip() for x in config.setting["preserved_tags"].split(',')]
+DATE_SEP = '-'
 
-relation_types = {
+RELATION_TYPES = {
     'work': [
         'arranger',
         'instrument arranger',
@@ -142,8 +308,10 @@ def get_options(album, track):
     override = {
         'artists': 'cea_override',
         'tagmap': 'ce_tagmap_override',
-        'workparts': 'cwp_override'}
+        'workparts': 'cwp_override',
+        'genres': 'ce_genres_override'}
     sect_text = {'artists': 'Artists', 'workparts': 'Works'}
+    prefix = {'artists': 'cea', 'workparts': 'cwp'}
 
     if album.tagger.config.setting['ce_options_overwrite'] and all(
             album.tagger.config.setting[override[sect]] for sect in sections):
@@ -161,11 +329,16 @@ def get_options(album, track):
     orig_metadata = None
     # Only look up files if needed
     file_options = {}
+    music_file = ''
     music_file_found = None
     found_file = False
+    start = datetime.now()
+    if options['log_info']:
+        log.info('Clock start at %s', start)
     for music_file in album.tagger.files:
         new_metadata = album.tagger.files[music_file].metadata
         orig_metadata = album.tagger.files[music_file].orig_metadata
+
         if options['log_info']:
             log.info('orig_metadata for file %s is', music_file)
             log.info(orig_metadata)
@@ -174,16 +347,12 @@ def get_options(album, track):
                 # find the tag with the options
                 for section in sections:
                     if options[override[section]]:
-                        if section == 'artists':
-                            prefix = 'cea'
-                        else:
-                            prefix = 'cwp'
-                        if options[prefix + '_options_tag'] + ':' + \
+                        if options[prefix[section] + '_options_tag'] + ':' + \
                                 section + '_options' in orig_metadata:
                             file_options[section] = interpret(
-                                orig_metadata[options[prefix + '_options_tag'] + ':' + section + '_options'])
-                        elif options[prefix + '_options_tag'] in orig_metadata:
-                            options_tag_contents = orig_metadata[options[prefix + '_options_tag']]
+                                orig_metadata[options[prefix[section] + '_options_tag'] + ':' + section + '_options'])
+                        elif options[prefix[section] + '_options_tag'] in orig_metadata:
+                            options_tag_contents = orig_metadata[options[prefix[section] + '_options_tag']]
                             if isinstance(options_tag_contents, list):
                                 options_tag_contents = options_tag_contents[0]
                             combined_options = ''.join(options_tag_contents.split(
@@ -212,8 +381,8 @@ def get_options(album, track):
                                     music_file)
                             append_tag(
                                 tm,
-                                '~' + prefix + '_error',
-                                'Saved ' +
+                                '~' + prefix[section] + '_error',
+                                '1. Saved ' +
                                 section +
                                 ' options cannot be read. Using current settings')
 
@@ -227,6 +396,12 @@ def get_options(album, track):
             if 'musicbrainz_trackid' not in tm:
                 if options['log_warning']:
                     log.warning('No trackid in track %s', track)
+
+    end = datetime.now()
+    if options['log_info']:
+        log.info('Clock end at %s', end)
+        log.info('Duration = %s', end - start)
+
     if not found_file:
         if options['log_warning']:
             log.warning(
@@ -237,84 +412,114 @@ def get_options(album, track):
             "002_important_warning",
             "No file with matching trackid - IF THERE SHOULD BE ONE, TRY 'REFRESH' - "
             "(unable to process any saved options, lyrics or 'keep' tags)")
-
-    for section in sections:
-        if options[override[section]]:
-            if section in file_options and file_options[section]:
-                options_dict = file_options[section]['Classical Extras'][sect_text[section] + ' options']
-                for opt in options_dict:
-                    if isinstance(
-                            options_dict[opt],
-                            dict) and options[override['tagmap']]:  # for tag line options
-                        opt_list = []
-                        for opt_item in options_dict[opt]:
-                            opt_list.append(
-                                {opt + '_' + opt_item: options_dict[opt][opt_item]})
-                    else:
-                        opt_list = [{opt: options_dict[opt]}]
-                    for opt_dict in opt_list:
-                        for opt in opt_dict:
-                            opt_value = opt_dict[opt]
-                            if section == 'artists':
-                                addn = plugin_options('tag') + plugin_options('picard')
-                            else:
-                                addn = []
-                            for ea_opt in plugin_options(section) + addn:
-                                displayed_option = options[ea_opt['option']]
-                                if ea_opt['name'] == opt:
-                                    if 'value' in ea_opt:
-                                        if ea_opt['value'] == opt_value:
-                                            options[ea_opt['option']] = True
-                                        else:
-                                            options[ea_opt['option']] = False
-                                    else:
-                                        options[ea_opt['option']] = opt_value
-                                    if options[ea_opt['option']
-                                               ] != displayed_option:
-                                        if options['log_debug']:
-                                            log.debug(
-                                                'Options overridden for option %s = %s', ea_opt['option'], opt_value)
-
-                                        opt_text = unicode(opt_value)
-                                        append_tag(
-                                            tm, '003_information:options_overridden', unicode(
-                                                ea_opt['name']) + ' = ' + opt_text)
-
-    if orig_metadata:
-        keep_list = options['cea_keep'].split(",")
-        if options['cea_split_lyrics'] and options['cea_lyrics_tag']:
-            keep_list.append(options['cea_lyrics_tag'])
-        PRESERVE.append(options['cwp_options_tag'] + ':workparts_options')
-        PRESERVE.append(options['cea_options_tag'] + ':artists_options')
-        really_keep_list = PRESERVE
-        for tagx in keep_list:
-            tag = tagx.strip()
-            really_keep_list.append(tag)
-            if tag in orig_metadata:
-                tm[tag] = orig_metadata[tag]
-        if options['cea_clear_tags']:
-            delete_list = []
-            for tag_item in orig_metadata:
-                if tag_item not in really_keep_list:
-                    delete_list.append(tag_item)
-            # this will be used in map_tags to delete unwanted tags
-            options['delete_tags'] = delete_list
-    if not isinstance(options, dict):
-        options_dict = option_settings(config.setting)
     else:
-        options_dict = options
-    tm['~ce_options'] = options_dict
-    tm['~ce_file'] = music_file_found
-    if options['log_info']:
-        log.info(
-            'Get_options is returning options shown below and file: %s',
-            music_file_found)
-        log.info(options_dict)
+        if options['log_info']:
+            log.info('Found music file: %r', music_file_found)
+        for section in sections:
+            if options[override[section]]:
+                if section in file_options and file_options[section]:
+                    try:
+                        options_dict = file_options[section]['Classical Extras'][sect_text[section] + ' options']
+                    except TypeError:
+                        if options['log_error']:
+                            log.error(
+                                '%s: Saved ' +
+                                section +
+                                ' options cannot be read for file %s. Using current settings',
+                                PLUGIN_NAME,
+                                music_file)
+                        append_tag(
+                            tm,
+                            '~' + prefix[section] + '_error',
+                            '1. Saved ' +
+                            section +
+                            ' options cannot be read. Using current settings')
+                        break
+                    for opt in options_dict:
+                        if isinstance(
+                                options_dict[opt],
+                                dict) and options[override['tagmap']]:  # for tag line options
+                            opt_list = []
+                            for opt_item in options_dict[opt]:
+                                opt_list.append(
+                                    {opt + '_' + opt_item: options_dict[opt][opt_item]})
+                        else:
+                            opt_list = [{opt: options_dict[opt]}]
+                        for opt_dict in opt_list:
+                            for opt in opt_dict:
+                                opt_value = opt_dict[opt]
+                                if section == 'artists':
+                                    if options[override['tagmap']]:
+                                        included_tag_options = plugin_options('tag')
+                                    else:
+                                        included_tag_options = []
+                                    addn = included_tag_options + plugin_options('picard')
+                                else:
+                                    if options[override['genres']]:
+                                        included_genre_options = plugin_options('genre')
+                                    else:
+                                        included_genre_options = []
+                                    addn = included_genre_options
+                                for ea_opt in plugin_options(section) + addn:
+                                    displayed_option = options[ea_opt['option']]
+                                    if ea_opt['name'] == opt:
+                                        if 'value' in ea_opt:
+                                            if ea_opt['value'] == opt_value:
+                                                options[ea_opt['option']] = True
+                                            else:
+                                                options[ea_opt['option']] = False
+                                        else:
+                                            options[ea_opt['option']] = opt_value
+                                        if options[ea_opt['option']
+                                                   ] != displayed_option:
+                                            if options['log_debug']:
+                                                log.debug(
+                                                    'Options overridden for option %s = %s', ea_opt['option'], opt_value)
+
+                                            opt_text = unicode(opt_value)
+                                            append_tag(
+                                                tm, '003_information:options_overridden', unicode(
+                                                    ea_opt['name']) + ' = ' + opt_text)
+
+        if orig_metadata:
+            keep_list = options['cea_keep'].split(",")
+            if options['cea_split_lyrics'] and options['cea_lyrics_tag']:
+                keep_list.append(options['cea_lyrics_tag'])
+            if options['cwp_genres_use_file'] and options['cwp_genre_tag']:
+                keep_list.append(options['cwp_genre_tag'])
+            PRESERVE.append(options['cwp_options_tag'] + ':workparts_options')
+            PRESERVE.append(options['cea_options_tag'] + ':artists_options')
+            really_keep_list = PRESERVE
+            for tagx in keep_list:
+                tag = tagx.strip()
+                really_keep_list.append(tag)
+                if tag in orig_metadata:
+                    tm[tag] = orig_metadata[tag]
+            if options['cea_clear_tags']:
+                delete_list = []
+                for tag_item in orig_metadata:
+                    if tag_item not in really_keep_list and tag_item[0] != '~':
+                        # the second condition is to ensure that (hidden) file variables are not deleted,
+                        #  as these are in orig_metadata, not track_metadata
+                        delete_list.append(tag_item)
+                # this will be used in map_tags to delete unwanted tags
+                options['delete_tags'] = delete_list
+        if not isinstance(options, dict):
+            options_dict = option_settings(config.setting)
+        else:
+            options_dict = options
+        tm['~ce_options'] = options_dict
+        tm['~ce_file'] = music_file_found
+        if options['log_info']:
+            log.info(
+                'Get_options is returning options shown below and file: %s',
+                music_file_found)
+            log.info(options_dict)
 
 
 def plugin_options(option_type):
     """
-    :param option_type: artists, tag, workparts or other
+    :param option_type: artists, tag, workparts, genres or other
     :return: the relevant dictionary for the type
     This function contains all the options data in one place - to prevent multiple repetitions elsewhere
     """
@@ -447,11 +652,12 @@ def plugin_options(option_type):
          'type': 'Boolean',
          'default': True
          },
-        {'option': 'cea_genres',
-         'name': 'infer work types',
-         'type': 'Boolean',
-         'default': True
-         },
+        # {'option': 'cea_genres',
+        #  'name': 'infer work types',
+        #  'type': 'Boolean',
+        #  'default': True
+        #  },
+        # Note that the above is no longer used - replaced by cwp_genres_infer from v0.9.2
         {'option': 'cea_credited',
          'name': 'use release credited-as name',
          'type': 'Boolean',
@@ -789,7 +995,186 @@ def plugin_options(option_type):
          'default': 'Medley of:'
          }
     ]
+    # OPtions on "Genres etc." tab
 
+    genre_options = [
+        {'option': 'cwp_genre_tag',
+         'name': 'main genre tag',
+         'type': 'Text',
+         'default': 'genre'
+         },
+        {'option': 'cwp_subgenre_tag',
+         'name': 'sub-genre tag',
+         'type': 'Text',
+         'default': 'sub-genre'
+         },
+        {'option': 'cwp_genres_use_file',
+         'name': 'source genre from file',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_genres_use_folks',
+         'name': 'source genre from folksonomy tags',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_genres_use_worktype',
+         'name': 'source genre from work-type(s)',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_genres_infer',
+         'name': 'infer genre from artist details(s)',
+         'type': 'Boolean',
+         'default': False
+         },
+        # Note that the "infer from artists" option was in  the "artists" section - legacy from v0.9.1 & prior
+        {'option': 'cwp_genres_classical_main',
+         'name': 'classical main genres',
+         'type': 'PlainText',
+         'default': 'Classical, Chamber music, Concerto, Symphony, Opera, Orchestral, Sonata, Choral, Aria, Ballet, '
+                    'Oratorio, Motet, Symphonic poem, Suite, Partita, Song-cycle, Overture, '
+                    'Mass, Cantata'
+         },
+        {'option': 'cwp_genres_classical_sub',
+         'name': 'classical main genres',
+         'type': 'PlainText',
+         'default': 'Chant, Classical crossover, Minimalism, Avant-garde, Impressionist, Aria, Duet, Trio, Quartet'
+         },
+        {'option': 'cwp_genres_other_main',
+         'name': 'general main genres',
+         'type': 'PlainText',
+         'default': 'Alternative music, Blues, Country, Dance, Easy listening, Electronic music, Folk, Folk / pop, '
+                    'Hip hop / rap, Indie,  Religious, Asian, Jazz, Latin, New age, Pop, R&B / Soul, Reggae, Rock, '
+                    'World music, Celtic folk, French Medieval'
+         },
+        {'option': 'cwp_genres_other_sub',
+         'name': 'general sub-genres',
+         'type': 'PlainText',
+         'default': 'Song, Vocal, Christmas, Instrumental'
+         },
+        {'option': 'cwp_genres_arranger_as_composer',
+         'name': 'treat arranger as for composer for genre-setting',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_genres_classical_all',
+         'name': 'make tracks classical',
+         'value': 'all',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_genres_classical_selective',
+         'name': 'make tracks classical',
+         'value': 'selective',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_genres_classical_exclude',
+         'name': 'exclude "classical" from main genre tag',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_genres_flag_text',
+         'name': 'classical flag',
+         'type': 'Text',
+         'default': '1'
+         },
+        {'option': 'cwp_genres_flag_tag',
+         'name': 'classical flag tag',
+         'type': 'Text',
+         'default': 'is_classical'
+         },
+        {'option': 'cwp_genres_default',
+         'name': 'default genre',
+         'type': 'Text',
+         'default': 'Other'
+         },
+        {'option': 'cwp_instruments_tag',
+         'name': 'instruments tag',
+         'type': 'Text',
+         'default': 'instrument'
+         },
+        {'option': 'cwp_instruments_MB_names',
+         'name': 'use MB instrument names',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_instruments_credited_names',
+         'name': 'use credited instrument names',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_key_tag',
+         'name': 'key tag',
+         'type': 'Text',
+         'default': 'key'
+         },
+        {'option': 'cwp_key_include',
+         'name': 'include key in workname',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_workdate_tag',
+         'name': 'workdate tag',
+         'type': 'Text',
+         'default': 'work_year'
+         },
+        {'option': 'cwp_workdate_source_composed',
+         'name': 'use composed for workdate',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_workdate_source_published',
+         'name': 'use published for workdate',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_workdate_source_premiered',
+         'name': 'use premiered for workdate',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_workdate_use_first',
+         'name': 'use workdate sources sequentially',
+         'value': 'sequence',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_workdate_use_all',
+         'name': 'use all workdate sources',
+         'value': 'all',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_workdate_annotate',
+         'name': 'annotate dates',
+         'type': 'Boolean',
+         'default': True
+         },
+        {'option': 'cwp_workdate_include',
+         'name': 'include workdate in workname',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_period_tag',
+         'name': 'period tag',
+         'type': 'Text',
+         'default': 'period'
+         },
+        {'option': 'cwp_periods_arranger_as_composer',
+         'name': 'treat arranger as for composer for period-setting',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_period_map',
+         'name': 'period map',
+         'type': 'PlainText',
+         'default': 'Early, -3000,800; Medieval, 800,1400; Renaissance, 1400, 1600; Baroque, 1600,1750; '
+                    'Classical, 1750,1820; Early Romantic, 1820,1850; Late Romantic, 1850,1910; 20th Century, 1910,1975'
+                    'Contemporary, 1975,2525'
+         }
+    ]
     # Picard options which are also saved
     picard_options = [
         {'option': 'standardize_artists',
@@ -867,7 +1252,42 @@ def plugin_options(option_type):
          'type': 'Integer',
          'default': 6
          },
-        {'option': 'log_error',
+        {'option': 'cwp_use_muso_refdb',
+         'name': 'use Muso ref database',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_muso_genres',
+         'name': 'use Muso classical genres',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_muso_classical',
+         'name': 'use Muso classical composers',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_muso_dates',
+         'name': 'use Muso composer dates',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_muso_periods',
+         'name': 'use Muso periods',
+         'type': 'Boolean',
+         'default': False
+         },
+        {'option': 'cwp_muso_path',
+         'name': 'path to Muso database',
+         'type': 'Text',
+         'default': 'C:\\Users\\Public\\Music\\muso\\database'
+         },
+        {'option': 'cwp_muso_refdb',
+         'name': 'name of Muso reference database',
+         'type': 'Text',
+         'default': 'Reference.xml'
+         },
+                {'option': 'log_error',
          'type': 'Boolean',
          'default': True
          },
@@ -907,6 +1327,10 @@ def plugin_options(option_type):
          'type': 'Boolean',
          'default': False
          },
+        {'option': 'ce_genres_override',
+         'type': 'Boolean',
+         'default': False
+         },
         {'option': 'ce_options_overwrite',
          'type': 'Boolean',
          'default': False
@@ -923,6 +1347,8 @@ def plugin_options(option_type):
         return tag_options
     elif option_type == 'workparts':
         return workparts_options
+    elif option_type == 'genres':
+        return genre_options
     elif option_type == 'picard':
         return picard_options
     elif option_type == 'other':
@@ -938,7 +1364,7 @@ def option_settings(config_settings):
     """
     options = {}
     for option in plugin_options('artists') + plugin_options('tag') + plugin_options(
-            'workparts') + plugin_options('picard') + plugin_options('other'):
+            'workparts') + plugin_options('genres') + plugin_options('picard') + plugin_options('other'):
         options[option['option']] = copy.deepcopy(
             config_settings[option['option']])
     return options
@@ -1053,7 +1479,7 @@ def get_artists(options, tm, relations, relation_type):
         'log_info': options['log_info']}
     artists = []
     instruments = []
-    artist_types = relation_types[relation_type]
+    artist_types = RELATION_TYPES[relation_type]
     for artist_type in artist_types:
         type_list = parse_data(
             log_options,
@@ -1415,6 +1841,7 @@ def set_work_artists(self, album, track, writerList, tm, count):
         cwp_tag = tag_strings[writer_type][1]
         cwp_sort_tag = tag_strings[writer_type][3]
         cwp_names_tag = cwp_tag[:-1] + '_names'
+        cwp_instrumented_tag = cwp_names_tag + '_instrumented'
         if writer_type in sub_strings:
             if sub_strings[writer_type]:
                 tag += sub_strings[writer_type]
@@ -1481,7 +1908,9 @@ def set_work_artists(self, album, track, writerList, tm, count):
                         self.append_tag(tm, explicit_sort_tag, sort_name)
 
             self.append_tag(tm, cwp_tag, annotated_name)
-            self.append_tag(tm, cwp_names_tag, instrumented_name)
+            self.append_tag(tm, cwp_names_tag, name)
+            if instrumented_name != name:
+                self.append_tag(tm, cwp_instrumented_tag, instrumented_name)
 
             if cwp_sort_tag:
                 self.append_tag(tm, cwp_sort_tag, sort_name)
@@ -1830,6 +2259,7 @@ def map_tags(options, album, tm):
             if len(new_last_names) > 0:
                 tm['album'] = "; ".join(new_last_names) + ": " + tm['album']
 
+    # lyricists
     if options['cea_no_lyricists'] and 'vocals' not in tm['~cea_performers']:
         if 'lyricist' in tm:
             del tm['lyricist']
@@ -1837,6 +2267,253 @@ def map_tags(options, album, tm):
         if '~cwp_' + lyricist_tag in tm:
             del tm['~cwp_' + lyricist_tag]
 
+    # genres
+    if config.setting['folksonomy_tags'] and 'genre' in tm:
+        candidate_genres = str_to_list(tm['genre'])
+        append_tag(tm, '~cea_candidate_genres', candidate_genres)
+        del tm['genre']  # to avoid confusion as it will contain unmatched folksonomy tags
+    else:
+        candidate_genres = []
+    is_classical = False
+    composers_not_found = []
+    composer_found = False
+    composer_born_list = []
+    composer_died_list = []
+    arrangers_not_found = []
+    arranger_found = False
+    arranger_born_list = []
+    arranger_died_list = []
+    if options['cwp_use_muso_refdb'] and options['cwp_muso_classical'] or options['cwp_muso_dates']:
+        if COMPOSER_DICT:
+            composer_list = str_to_list(tm['~cwp_composer_names'])
+            lc_composer_list = [c.lower() for c in composer_list]
+            for composer in lc_composer_list:
+                for classical_composer in COMPOSER_DICT:
+                    if composer in classical_composer['lc_name']:
+                        if options['cwp_muso_classical']:
+                            candidate_genres.append('Classical')
+                            is_classical = True
+                        if options['cwp_muso_dates']:
+                            composer_born_list = classical_composer['birth']
+                            composer_died_list = classical_composer['death']
+                        composer_found = True
+                        break
+                if not composer_found:
+                    composer_index = lc_composer_list.index(composer)
+                    orig_composer = composer_list[composer_index]
+                    composers_not_found.append(orig_composer)
+                    append_tag(tm, '~cwp_unrostered_composers', orig_composer)
+            if composers_not_found:
+                append_tag(tm, '003_information:composers', 'Composer(s) '
+                           + list_to_str(composers_not_found) + ' not found in reference database of classical composers')
+
+            # do the same for arrangers, if required
+            if options['cwp_genres_arranger_as_composer'] or options['cwp_periods_arranger_as_composer']:
+                arranger_list = str_to_list(tm['~cea_arranger_names']) + str_to_list(tm['~cwp_arranger_names'])
+                lc_arranger_list = [c.lower() for c in arranger_list]
+                for arranger in lc_arranger_list:
+                    for classical_arranger in COMPOSER_DICT:
+                        if arranger in classical_arranger['lc_name']:
+                            if options['cwp_muso_classical'] and options['cwp_genres_arranger_as_composer']:
+                                candidate_genres.append('Classical')
+                                is_classical = True
+                            if options['cwp_muso_dates'] and options['cwp_periods_arranger_as_composer']:
+                                arranger_born_list = classical_arranger['birth']
+                                arranger_died_list = classical_arranger['death']
+                            arranger_found = True
+                            break
+                    if not arranger_found:
+                        arranger_index = lc_arranger_list.index(arranger)
+                        orig_arranger = arranger_list[arranger_index]
+                        arrangers_not_found.append(orig_arranger)
+                        append_tag(tm, '~cwp_unrostered_arrangers', orig_arranger)
+                if arrangers_not_found:
+                    append_tag(tm, '003_information:arrangers', 'Arranger(s) '
+                               + list_to_str(
+                        arrangers_not_found) + ' not found in reference database of classical composers')
+
+        else:
+            append_tag(tm, '001_errors:8', '8. No composer reference file. Check log for error messages re path name.')
+    if options['cwp_use_muso_refdb'] and options['cwp_muso_genres'] and GENRE_DICT:
+        main_classical_genres_list = [list_to_str(mg['name']).strip() for mg in GENRE_DICT]
+    else:
+        main_classical_genres_list = [sg.strip() for sg in options['cwp_genres_classical_main'].split(',')]
+    sub_classical_genres_list = [sg.strip() for sg in options['cwp_genres_classical_sub'].split(',')]
+    main_other_genres_list = [sg.strip() for sg in options['cwp_genres_other_main'].split(',')]
+    sub_other_genres_list = [sg.strip() for sg in options['cwp_genres_other_sub'].split(',')]
+    main_classical_genres = []
+    sub_classical_genres = []
+    main_other_genres = []
+    sub_other_genres = []
+    if '~cea_work_type' in tm:
+        candidate_genres += str_to_list(tm['~cea_work_type'])
+    if '~cwp_candidate_genres' in tm:
+        candidate_genres += str_to_list(tm['~cwp_candidate_genres'])
+    if INFO:
+        log.info("Candidate genres: ", candidate_genres)
+    untagged_genres = []
+    if candidate_genres:
+        main_classical_genres = [val for val in main_classical_genres_list
+                                 if val.lower() in [genre.lower() for genre in candidate_genres]]
+        sub_classical_genres = [val for val in sub_classical_genres_list
+                                 if val.lower() in [genre.lower() for genre in candidate_genres]]
+
+        if main_classical_genres or sub_classical_genres or options['cwp_genres_classical_all']:
+            is_classical = True
+            main_classical_genres.append('Classical')
+            candidate_genres += str_to_list(tm['~cea_work_type_if_classical'])
+            # next two are repeated statements, but a separate fn would be clumsy too!
+            main_classical_genres = [val for val in main_classical_genres_list
+                                     if val.lower() in [genre.lower() for genre in candidate_genres]]
+            sub_classical_genres = [val for val in sub_classical_genres_list
+                                    if val.lower() in [genre.lower() for genre in candidate_genres]]
+        if options['cwp_genres_classical_exclude']:
+            main_classical_genres = [g for g in main_classical_genres if g.lower() != 'classical']
+
+        main_other_genres = [val for val in main_other_genres_list
+                                 if val.lower() in [genre.lower() for genre in candidate_genres]]
+        sub_other_genres = [val for val in sub_other_genres_list
+                                 if val.lower() in [genre.lower() for genre in candidate_genres]]
+        all_genres = main_classical_genres + sub_classical_genres + main_other_genres + sub_other_genres
+        untagged_genres = [un for un in candidate_genres
+                           if un.lower() not in [genre.lower() for genre in all_genres]]
+
+
+    if options['cwp_genre_tag']:
+        append_tag(tm, options['cwp_genre_tag'], main_classical_genres + main_other_genres)
+    if options['cwp_subgenre_tag']:
+        append_tag(tm, options['cwp_subgenre_tag'], sub_classical_genres + sub_other_genres)
+    if is_classical and options['cwp_genres_flag_text'] and options['cwp_genres_flag_tag']:
+        tm[options['cwp_genres_flag_tag']] = options['cwp_genres_flag_text']
+    if not (main_classical_genres + main_other_genres):
+        if options['cwp_genres_default']:
+            append_tag(tm, options['cwp_genre_tag'], options['cwp_genres_default'])
+        else:
+            if options['cwp_genre_tag'] in tm:
+                del tm[options['cwp_genre_tag']]
+    if untagged_genres:
+        append_tag(tm, '003_information:genres',
+                   'Candidate genres found but not matched: ' + list_to_str(untagged_genres))
+        append_tag(tm, '~cwp_untagged_genres', untagged_genres)
+
+    # instruments and keys
+    if options['cwp_instruments_MB_names'] and options['cwp_instruments_credited_names'] and tm['~cea_instruments_all']:
+        instruments = tm['~cea_instruments_all']
+    elif options['cwp_instruments_MB_names'] and tm['~cea_instruments']:
+        instruments = tm['~cea_instruments']
+    elif options['cwp_instruments_credited_names'] and tm['~cea_instruments_credited']:
+        instruments = tm['~cea_instruments_credited']
+    else:
+        instruments = None
+    if instruments and options['cwp_instruments_tag']:
+        append_tag(tm, options['cwp_instruments_tag'], instruments)
+        # need to append rather than over-write as it may be the same as another tag (e.g. genre)
+    if tm['~cwp_keys'] and options['cwp_key_tag']:
+        append_tag(tm, options['cwp_key_tag'], tm['~cwp_keys'])
+
+    # dates
+    if options['cwp_workdate_annotate']:
+        comp = ' (composed)'
+        publ = ' (published)'
+        prem = ' (premiered)'
+    else:
+        comp = ''
+        publ = ''
+        prem = ''
+    tm[options['cwp_workdate_tag']] = ''
+    earliest_date = 9999
+    latest_date = -9999
+    found = False
+    if tm['~cwp_composed_dates']:
+        composed_dates_list = str_to_list(tm['~cwp_composed_dates'])
+        if len(composed_dates_list) > 1:
+            composed_dates_list = str_to_list(composed_dates_list[0])  # use dates of lowest-level work
+        earliest_date = min([int(dates.split(DATE_SEP)[0].strip()) for dates in composed_dates_list])
+        append_tag(tm, options['cwp_workdate_tag'], list_to_str(composed_dates_list) + comp)
+        found = True
+    if tm['~cwp_published_dates'] and (not found or options['cwp_workdate_use_all']):
+        if not found:
+            published_dates_list = str_to_list(tm['~cwp_published_dates'])
+            if len(published_dates_list) > 1:
+                published_dates_list = str_to_list(published_dates_list[0])  # use dates of lowest-level work
+            earliest_date = min([int(dates.split(DATE_SEP)[0].strip()) for dates in published_dates_list])
+            append_tag(tm, options['cwp_workdate_tag'], list_to_str(published_dates_list) + publ)
+            found = True
+    if tm['~cwp_premiered_dates'] and (not found or options['cwp_workdate_use_all']):
+        if not found:
+            premiered_dates_list = str_to_list(tm['~cwp_premiered_dates'])
+            if len(premiered_dates_list) > 1:
+                premiered_dates_list = str_to_list(premiered_dates_list[0])  # use dates of lowest-level work
+            earliest_date = min([int(dates.split(DATE_SEP)[0].strip()) for dates in premiered_dates_list])
+            append_tag(tm, options['cwp_workdate_tag'], list_to_str(premiered_dates_list) + prem)
+
+    # periods
+    PERIODS = {}
+    if options['cwp_period_map']:
+        if options['cwp_use_muso_refdb'] and options['cwp_muso_periods'] and PERIOD_DICT:
+            for p_item in PERIOD_DICT:
+                if 'start' not in p_item or p_item['start'] == []:
+                    p_item['start'] = [u'-9999']
+                if 'end' not in p_item or p_item['end'] == []:
+                    p_item['end'] = [u'2525']
+                if 'name' not in p_item or p_item['name'] == []:
+                    p_item['name'] = ['NOT SPECIFIED']
+            PERIODS = {list_to_str(mp['name']).strip(): (
+                list_to_str(mp['start']),
+                list_to_str(mp['end']))
+                for mp in PERIOD_DICT}
+            for period in PERIODS:
+                if PERIODS[period][0].lstrip('-').isdigit() and PERIODS[period][1].lstrip('-').isdigit():
+                    PERIODS[period] = (int(PERIODS[period][0]), int(PERIODS[period][1]))
+                else:
+                    PERIODS[period] = 'ERROR - start and/or end of ' + period + ' are not integers'
+
+        else:
+            periods = [p.strip() for p in options['cwp_period_map'].split(';')]
+            for p in periods:
+                p = p.split(',')
+                if len(p) == 3:
+                    period = p[0].strip()
+                    start = p[1].strip()
+                    end = p[2].strip()
+                    if start.lstrip('-').isdigit() and end.lstrip('-').isdigit():
+                        PERIODS[period] = (int(start), int(end))
+                    else:
+                        PERIODS[period] = 'ERROR - start and/or end of ' + period + ' are not integers'
+                else:
+                    PERIODS[p[0]] = 'ERROR in period map - each item must contain 3 elements'
+    if options['cwp_period_tag'] and PERIODS:
+        if earliest_date == 9999:  # i.e. no work date found
+            if options['cwp_use_muso_refdb'] and options['cwp_muso_dates']:
+                for composer_born in composer_born_list + arranger_born_list:
+                    if composer_born and composer_born.isdigit():
+                        birthdate = int(composer_born)
+                        earliest_date = min(earliest_date, birthdate + 20)  # productive age is taken as 20->death as per Muso
+                        for composer_died in composer_died_list + arranger_died_list:
+                            if composer_died and composer_died.isdigit():
+                                deathdate = int(composer_died)
+                                latest_date = max(latest_date, deathdate)
+                            else:
+                                latest_date = datetime.now().year
+        for period in PERIODS:
+            if 'ERROR' in PERIODS[period]:
+                tm[options['cwp_period_tag']] = ''
+                append_tag(
+                    tm,
+                    '001_errors:9',
+                    '9. ' + PERIODS[period])
+                break
+            if earliest_date < 9999:
+                if PERIODS[period][0] <= earliest_date <= PERIODS[period][1]:
+                    append_tag(tm, options['cwp_period_tag'], period)
+            if latest_date > -9999:
+                if PERIODS[period][0] <= latest_date <= PERIODS[period][1]:
+                    append_tag(tm, options['cwp_period_tag'], period)
+
+
+
+
+    # generic tag mapping
     sort_tags = options['cea_tag_sort']
     if sort_tags:
         tm['artists_sort'] = tm['~artists_sort']
@@ -1920,9 +2597,13 @@ def map_tags(options, album, tm):
                     else:
                         pass
     if ERROR and "~cea_error" in tm:
-        append_tag(tm, '001_errors', tm['~cea_error'], ['; '])
+        for error in str_to_list(tm['~cea_error']):
+            ecode = error[0]
+            append_tag(tm, '001_errors:' + ecode, error)
     if WARNING and "~cea_warning" in tm:
-        append_tag(tm, '002_warnings', tm['~cea_warning'], ['; '])
+        for warning in str_to_list(tm['~cea_warning']):
+            wcode = warning[0]
+        append_tag(tm, '002_warnings:' + wcode , warning)
     if not DEBUG:
         if '~cea_works_complete' in tm:
             del tm['~cea_works_complete']
@@ -1949,10 +2630,11 @@ def map_tags(options, album, tm):
             warn = []
             for delete_item in options['delete_tags']:
                 if delete_item not in tm:  # keep the original for comparison if we have a new version
-                    del orig_metadata[delete_item]
-                    warn.append(delete_item)
+                    if delete_item in orig_metadata:
+                        del orig_metadata[delete_item]
+                        warn.append(delete_item)
             if warn and WARNING:
-                append_tag(tm, '002_warnings', 'Deleted tags: ' + ', '.join(warn))
+                append_tag(tm, '002_warnings:7', '7. Deleted tags: ' + ', '.join(warn))
                 log.warning('Deleted tags: ' + ', '.join(warn))
 
 def sort_suffix(tag):
@@ -2040,88 +2722,6 @@ def append_tag(tm, tag, source, separators=None):
                         # probably makes no difference to specify a list as Picard will convert the tag to string,
                         # but do it anyway
 
-
-def parse_data(options, obj, response_list, *match):
-    """
-    :param options:
-    :param obj: an XmlNode object, list or dictionary containing nodes
-    :param response_list: working memory for recursive calls
-    :param match: list of items to search for in node (see detailed notes below
-    :return: a list of matching items (always a list, even if only one item)
-    This function takes any XmlNode object, or list thereof,
-    and extracts a list of all objects exactly matching the hierarchy listed in match
-    match should contain list of each node in hierarchical sequence, with no gaps in the sequence
-     of nodes, to lowest level required.
-    Insert attribs.attribname:attribvalue in the list to select only branches where attribname
-     is attribvalue.
-    Insert childname.text:childtext in the list to select only branches where
-     a sibling with childname has text childtext.
-      (Note: childname can be a dot-list if the text is more than one level down - e.g. child1.child2)
-      # TODO - Check this works fully
-    """
-
-    DEBUG = False  # options["log_debug"]
-    INFO = False  # options["log_info"]
-    # Over-ridden options as these can be VERY wordy
-
-    # XmlNode instances are not iterable, so need to convert to dict
-    if isinstance(obj, XmlNode):
-        obj = obj.__dict__
-    if DEBUG:
-        log.debug('%s: parsing data - looking for %s', PLUGIN_NAME, match)
-    if INFO:
-        log.info('looking in %s', obj)
-    if isinstance(obj, list):
-        for item in obj:
-            if isinstance(item, XmlNode):
-                item = item.__dict__
-            parse_data(options, item, response_list, *match)
-        if INFO:
-            log.info('response_list: %s', response_list)
-        return response_list
-    elif isinstance(obj, dict):
-        if match[0] in obj:
-            if len(match) == 1:
-                response = obj[match[0]]
-                response_list.append(response)
-            else:
-                match_list = list(match)
-                match_list.pop(0)
-                parse_data(
-                    options, obj[match[0]], response_list, *match_list)
-            if INFO:
-                log.info('response_list: %s', response_list)
-            return response_list
-        elif '.' in match[0]:
-            test = match[0].split(':')
-            match2 = test[0].split('.')
-            test_data = parse_data(options, obj, [], *match2)
-            if len(test) > 1:
-                if test[1] in test_data:
-                    if len(match) == 1:
-                        response = obj
-                        response_list.append(response)
-                    else:
-                        match_list = list(match)
-                        match_list.pop(0)
-                        parse_data(
-                            options, obj, response_list, *match_list)
-            else:
-                parse_data(options, obj, response_list, *match2)
-            if INFO:
-                log.info('response_list: %s', response_list)
-            return response_list
-        else:
-            if 'children' in obj:
-                parse_data(
-                    options, obj['children'], response_list, *match)
-            if INFO:
-                log.info('response_list: %s', response_list)
-            return response_list
-    else:
-        if INFO:
-            log.info('response_list: %s', response_list)
-        return response_list
 
 
 def get_artist_credit(options, obj):
@@ -2284,12 +2884,12 @@ def composer_last_names(self, tm, album):
             self.append_tag(
                 tm,
                 '~cea_warning',
-                'Composer for this track is not in album artists and will not be available to prefix album')
+                '1. Composer for this track is not in album artists and will not be available to prefix album')
         else:
             self.append_tag(
                 tm,
                 '~cea_warning',
-                'No composer for this track, but checking parent work.')
+                '1. No composer for this track, but checking parent work.')
 
 
 def add_list_uniquely(list_to, list_from):
@@ -2319,10 +2919,25 @@ def str_to_list(s):
     :return: list from string using ; as separator
     """
     if not isinstance(s, basestring):
-        return list(s)
+        try:
+            return list(s)
+        except TypeError:
+            return []
     else:
-        return s.split('; ')
+        if s == '':
+            return []
+        else:
+            return s.split('; ')
 
+def list_to_str(l):
+    """
+    :param l:
+    :return: string from list using ; as separator
+    """
+    if not isinstance(l, list):
+        return l
+    else:
+        return '; '.join(l)
 
 def interpret(tag):
     """
@@ -2334,7 +2949,7 @@ def interpret(tag):
             tag = tag.strip(' \n\t')
             return eval(tag)
         except SyntaxError:
-            return ''
+            return tag
     else:
         return tag
 
@@ -2375,6 +2990,20 @@ def seq_last_names(self, album):
         ln = ln[::-1]
     return [a[0] for a in ln]
 
+def year(date):
+    """
+    Return YYYY portion of date(s) in YYYY-MM-DD format (may be incomplete, string or list)
+    :param date:
+    :return: YYYY
+    """
+    if isinstance(date, list):
+        year_list = [d.split('-')[0] for d in date]
+        return year_list
+    else:
+        date_list = date.split('-')
+        return date_list[0]
+
+
 #################
 #################
 # EXTRA ARTISTS #
@@ -2414,6 +3043,7 @@ class ExtraArtists():
         # Boolean for each track to indicate if lyricist has been found (don't
         # want to add more from higher levels)
         # NB this last one is for completeness - not actually used by ExtraArtists, but here to remove pep8 error
+
     def add_artist_info(
             self,
             album,
@@ -2465,8 +3095,16 @@ class ExtraArtists():
         if not options["classical_extra_artists"]:
             return
         # NOT USED
-        # files = album.tagger.get_files_from_objects([album])
-        # log.error('ALBUM FILENAMES = %s', files)
+        album_files = album.tagger.get_files_from_objects([album])
+        if options['log_info']:
+            log.info('ALBUM FILENAMES for album %r = %s', album, album_files)
+        track_files = track.iterfiles(Track(track, album))
+        # tf = uniqify(chain(*[track.iterfiles(Track(t, album))for t in [track]]))
+        # tf = Tagger.get_files_from_objects(Track(track, album), [track])
+        # tf = uniqify(chain(*[t.iterfiles(album) for t in [track]]))
+        # tf = track.tagger.get_files_from_objects([track])
+        # log.error('TRACK FILENAMES for track %r = %s', track, track_files)
+        # log.error('TRACK FILENAMES 2 for track %r = %s', track, tf)
         if not (
             options["ce_no_run"] and (
                 not tm['~ce_file'] or tm['~ce_file'] == "None")):
@@ -2515,7 +3153,7 @@ class ExtraArtists():
                     tm['~cea_instruments'] = self.album_instruments[album][0]
                     tm['~cea_instruments_credited'] = self.album_instruments[album][1]
                     tm['~cea_instruments_all'] = self.album_instruments[album][2]
-                    # Should be OK to intialise these here as recording artists
+                    # Should be OK to initialise these here as recording artists
                     # yet to be processed
 
             track_artist_list = parse_data(
@@ -2810,109 +3448,103 @@ class ExtraArtists():
                 ",") + options['cea_blank_tag_2'].split(",")
 
             # set work-type before any tags are blanked
-            # (this will be more customisable when genre UI is introduced)
-            if options['cea_genres']:
+            # Note that this is now mixed in with other sources of genres in def map_tags
+            # ~cea_work_type_if_classical is used for types that are specifically classical
+            # and is only applied in map_tags if the track is deemed to be classical
+            if options['cwp_genres_infer']:
                 if (self.globals[track]['is_recording'] and options['classical_work_parts']
                         and '~artists_sort' in tm and 'composersort' in tm
                         and any(x in tm['~artists_sort'] for x in tm['composersort'])
-                        and 'writer' not in tm) \
-                        or ('is_classical' in tm and tm['is_classical'] == '1'):
+                        and 'writer' not in tm):
                     self.append_tag(tm, '~cea_work_type', 'Classical')
 
-                instrument = re.compile(r'.*\((.+)\)')
-                vocals = re.compile(r'.*\(((.*)vocals)\)')
+                if isinstance(tm['~cea_soloists'], basestring):
+                    soloists = re.split(
+                        '|'.join(
+                            self.SEPARATORS),
+                        tm['~cea_soloists'])
+                else:
+                    soloists = tm['~cea_soloists']
+                if '~cea_vocalists' in tm:
+                    if isinstance(tm['~cea_vocalists'], basestring):
+                        vocalists = re.split(
+                            '|'.join(
+                                self.SEPARATORS),
+                            tm['~cea_vocalists'])
+                    else:
+                        vocalists = tm['~cea_vocalists']
+                else:
+                    vocalists = []
+
                 if '~cea_ensembles' in tm:
                     large = False
                     if 'performer:orchestra' in tm:
                         large = True
-                        self.append_tag(tm, '~cea_work_type', 'Orchestral')
+                        self.append_tag(tm, '~cea_work_type_if_classical', 'Orchestral')
                         if '~cea_soloists' in tm:
-                            if 'vocals' in tm['~cea_soloists']:
-                                self.append_tag(tm, '~cea_work_type', 'Voice')
-                            if isinstance(tm['~cea_soloists'], basestring):
-                                soloists = re.split(
-                                    '|'.join(
-                                        self.SEPARATORS),
-                                    tm['~cea_soloists'])
-                            else:
-                                soloists = tm['~cea_soloists']
+                            if 'vocals' in tm['~cea_instruments_all']:
+                                self.append_tag(tm, '~cea_work_type', 'Vocal')
                             if len(soloists) == 1:
-                                match = instrument.search(soloists[0])
-                                if match:
-                                    if 'vocals' not in match.group(1).lower():
-                                        self.append_tag(
-                                            tm, '~cea_work_type', 'Concerto')
-                                        self.append_tag(
-                                            tm, '~cea_work_type', match.group(1))
-                                    else:
-                                        self.append_tag(
-                                            tm, '~cea_work_type', 'Aria')
-                                        match2 = vocals.search(soloists[0])
-                                        if match2:
-                                            self.append_tag(
-                                                tm, '~cea_work_type', match2.group(2).strip())
+                                if soloists != vocalists:
+                                    self.append_tag(
+                                        tm, '~cea_work_type_if_classical', 'Concerto')
+                                else:
+                                    self.append_tag(
+                                        tm, '~cea_work_type_if_classical', 'Aria')
                             elif len(soloists) == 2:
-                                self.append_tag(tm, '~cea_work_type', 'Duet')
-                                for i in range(0, 2):
-                                    match = instrument.search(soloists[i])
-                                    if match:
-                                        if 'vocals' not in match.group(
-                                                1).lower():
-                                            self.append_tag(
-                                                tm, '~cea_work_type', 'Concerto')
-                                            self.append_tag(
-                                                tm, '~cea_work_type', match.group(1))
+                                self.append_tag(tm, '~cea_work_type_if_classical', 'Duet')
+                                if not vocalists:
+                                    self.append_tag(
+                                        tm, '~cea_work_type_if_classical', 'Concerto')
+                            elif len(soloists) == 3:
+                                self.append_tag(tm, '~cea_work_type_if_classical', 'Trio')
+                            elif len(soloists) == 4:
+                                self.append_tag(tm, '~cea_work_type_if_classical', 'Quartet')
 
                     if 'performer:choir' in tm or 'performer:choir vocals' in tm:
                         large = True
-                        self.append_tag(tm, '~cea_work_type', 'Choral')
-                        self.append_tag(tm, '~cea_work_type', 'Voice')
+                        self.append_tag(tm, '~cea_work_type_if_classical', 'Choral')
+                        self.append_tag(tm, '~cea_work_type', 'Vocal')
                     else:
                         if large and 'soloists' in tm and tm['soloists'].count(
                                 'vocals') > 1:
-                            self.append_tag(tm, '~cea_work_type', 'Opera')
+                            self.append_tag(tm, '~cea_work_type_if_classical', 'Opera')
                     if not large:
                         if '~cea_soloists' not in tm:
-                            self.append_tag(tm, '~cea_work_type', 'Chamber')
+                            self.append_tag(tm, '~cea_work_type_if_classical', 'Chamber music')
                         else:
-                            if 'vocals' in tm['~cea_soloists']:
+                            if vocalists:
                                 self.append_tag(tm, '~cea_work_type', 'Song')
-                                self.append_tag(tm, '~cea_work_type', 'Voice')
+                                self.append_tag(tm, '~cea_work_type', 'Vocal')
                             else:
                                 self.append_tag(
-                                    tm, '~cea_work_type', 'Chamber')
+                                    tm, '~cea_work_type_if_classical', 'Chamber music')
                 else:
-                    if '~cea_soloists' in tm:
-                        if isinstance(tm['~cea_soloists'], basestring):
-                            soloists = re.split(
-                                '|'.join(
-                                    self.SEPARATORS),
-                                tm['~cea_soloists'])
-                        else:
-                            soloists = tm['~cea_soloists']
-                        if len(soloists) == 1:
-                            match = instrument.search(soloists[0])
-                            if match:
-                                if 'vocals' not in match.group(1).lower():
-                                    self.append_tag(
-                                        tm, '~cea_work_type', 'Instrumental')
-                                    self.append_tag(
-                                        tm, '~cea_work_type', match.group(1).title())
-                                else:
-                                    self.append_tag(
-                                        tm, '~cea_work_type', 'Song')
-                                    self.append_tag(
-                                        tm, '~cea_work_type', 'Voice')
-                                    self.append_tag(
-                                        tm, '~cea_work_type', match.group(1).title())
-                        else:
-                            if 'vocals' not in soloists:
+                    if len(soloists) == 1:
+                            if vocalists != soloists:
                                 self.append_tag(
-                                    tm, '~cea_work_type', 'Chamber')
+                                    tm, '~cea_work_type', 'Instrumental')
                             else:
-                                self.append_tag(tm, '~cea_work_type', 'Song')
-                                self.append_tag(tm, '~cea_work_type', 'Voice')
+                                self.append_tag(
+                                    tm, '~cea_work_type', 'Song')
+                                self.append_tag(
+                                    tm, '~cea_work_type', 'Vocal')
+                    elif len(soloists) == 2:
+                        self.append_tag(tm, '~cea_work_type_if_classical', 'Duet')
+                    elif len(soloists) == 3:
+                        self.append_tag(tm, '~cea_work_type_if_classical', 'Trio')
+                    elif len(soloists) == 4:
+                        self.append_tag(tm, '~cea_work_type_if_classical', 'Quartet')
+                    else:
+                        if not vocalists:
+                            self.append_tag(
+                                tm, '~cea_work_type_if_classical', 'Chamber music')
+                        else:
+                            self.append_tag(tm, '~cea_work_type', 'Song')
+                            self.append_tag(tm, '~cea_work_type', 'Vocal')
             # blank tags
+            if 'artists_sort' in [x.strip() for x in blank_tags]:
+                blank_tags.append('~artists_sort')
             for tag in blank_tags:
                 if tag.strip() in tm:
                     # place blanked tags into hidden variables available for
@@ -3072,7 +3704,7 @@ class ExtraArtists():
                                     self.append_tag(
                                         tm,
                                         '~cea_warning',
-                                        'Duplicated performer information for "' +
+                                        '2. Duplicated performer information for "' +
                                         '; '.join(
                                             performer[3]) +
                                         '" (may be in Release Relationship as well as Track Relationship).'
@@ -3144,6 +3776,7 @@ class ExtraArtists():
             sort_tag = tag_strings[artist_type][2]
             cea_sort_tag = tag_strings[artist_type][3]
             cea_names_tag = cea_tag[:-1] + '_names'
+            cea_instrumented_tag = cea_names_tag + '_instrumented'
             if artist_type in sub_strings:
                 if sub_strings[artist_type]:
                     tag += sub_strings[artist_type]
@@ -3226,11 +3859,15 @@ class ExtraArtists():
                             self.append_tag(tm, explicit_sort_tag, sort_name)
 
                 self.append_tag(tm, cea_tag, annotated_name)
-                if artist_type not in [
-                        'instrument', 'vocal', 'performing orchestra']:
-                    self.append_tag(tm, cea_names_tag, instrumented_name)
-                else:
-                    self.append_tag(tm, cea_names_tag, name)
+                # if artist_type not in [
+                #         'instrument', 'vocal', 'performing orchestra']:
+                #     self.append_tag(tm, cea_names_tag, instrumented_name)
+                # else:
+                #     self.append_tag(tm, cea_names_tag, name)
+                self.append_tag(tm, cea_names_tag, name)
+                if instrumented_name != name:
+                    self.append_tag(tm, cea_instrumented_tag, instrumented_name)
+
                 if cea_sort_tag:
                     self.append_tag(tm, cea_sort_tag, sort_name)
 
@@ -3699,7 +4336,7 @@ class PartLevels():
             self.append_tag(
                 track_metadata,
                 '~cwp_warning',
-                'No works for this track')
+                '3. No works for this track')
             if album in self.orphan_tracks:
                 if track not in self.orphan_tracks[album]:
                     self.orphan_tracks[album].append(track)
@@ -3752,7 +4389,7 @@ class PartLevels():
                                 self.append_tag(
                                     tm,
                                     '~cwp_warning',
-                                    'File tag musicbrainz_workid incorrect? id = ' +
+                                    '4. File tag musicbrainz_workid incorrect? id = ' +
                                     orig_metadata['musicbrainz_workid'] +
                                     '. Sourcing from MB')
                                 return None
@@ -3769,7 +4406,7 @@ class PartLevels():
                             log.error(
                                 "%s: No matching work name for id tag %s", PLUGIN_NAME, wid)
                         self.append_tag(
-                            tm, '~cwp_error', 'No matching work name for id tag ' + wid)
+                            tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
                         return None
                     n = 1
                     while 'musicbrainz_work_part_level' + \
@@ -3788,7 +4425,7 @@ class PartLevels():
                                 log.error(
                                     "%s: No matching work name for id tag %s", PLUGIN_NAME, wid)
                             self.append_tag(
-                                tm, '~cwp_error', 'No matching work name for id tag ' + wid)
+                                tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
                             break
                     if orig_metadata['musicbrainz_work_composition_id'] != orig_metadata[
                             'musicbrainz_workid']:
@@ -3802,7 +4439,7 @@ class PartLevels():
                                 log.error(
                                     "%s: No matching work name for id tag %s", PLUGIN_NAME, wid)
                             self.append_tag(
-                                tm, '~cwp_error', 'No matching work name for id tag ' + wid)
+                                tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
                             return None
                     file_work_levels = len(self.file_works[(album, track)])
                     if self.DEBUG:
@@ -3905,14 +4542,14 @@ class PartLevels():
             if config.setting['cwp_aliases'] and config.setting['cwp_aliases_tag_text']:
                 if config.setting['cwp_aliases_tags_user'] and user_data:
                     login = True
-                    tag_type = '+user-tags'
+                    tag_type = '+tags +user-tags'
                 else:
                     login = False
                     tag_type = '+tags'
             else:
                 login = False
                 tag_type = ''
-            queryargs = {"inc": "work-rels+artist-rels+aliases" + tag_type}
+            queryargs = {"inc": "work-rels+artist-rels+label-rels+place-rels+aliases" + tag_type}
             if self.DEBUG:
                 log.debug(
                     "%s: Initiating XML lookup for %s......",
@@ -3978,7 +4615,7 @@ class PartLevels():
                         self.append_tag(
                             track.metadata,
                             '~cwp_error',
-                            'Authentication failure - data retrieval omits user-specific requests')
+                            '3. Authentication failure - data retrieval omits user-specific requests')
                     self.work_add_track(
                         album, track, workId, tries + 1, user_data)
                 else:
@@ -3990,7 +4627,7 @@ class PartLevels():
                         self.append_tag(
                             track.metadata,
                             '~cwp_error',
-                            "ERROR: MISSING METADATA due to network errors. Re-try or fix manually.")
+                            "4. ERROR: MISSING METADATA due to network errors. Re-try or fix manually.")
                 self.album_remove_request(album)
             return
         tuples = self.works_queue.remove(workId)
@@ -4058,6 +4695,9 @@ class PartLevels():
                         if self.INFO:
                             log.info(
                                 'Parents - ids: %s, names: %s', parentIds, parents)
+                        # de-dup parent ids before we start
+                        parentIds = list(
+                            collections.OrderedDict.fromkeys(parentIds))
                         if parentIds:
                             if wid in self.works_cache:
                                 prev_ids = tuple(self.works_cache[wid])
@@ -4077,20 +4717,17 @@ class PartLevels():
                                 self.parts[new_ids]['name'] = add_list_uniquely(
                                     prev_name, parents)
                                 parentIds = new_id_list
-
                             else:
                                 self.works_cache[wid] = parentIds
                                 self.parts[wid]['parent'] = parentIds
                                 self.parts[tuple(parentIds)]['name'] = parents
                                 self.work_listing[album].append(
                                     tuple(parentIds))
-
                             # de-duplicate the parent names
                             self.parts[tuple(parentIds)]['name'] = list(
                                 collections.OrderedDict.fromkeys(self.parts[tuple(parentIds)]['name']))
                             # list(set()) won't work as need to retain
                             # order
-
                             # de-duplicate the parent ids also, otherwise they will be treated as a separate parent
                             # in the trackback structure
                             self.parts[wid]['parent'] = list(
@@ -4099,7 +4736,6 @@ class PartLevels():
                             self.works_cache[wid] = list(
                                 collections.OrderedDict.fromkeys(
                                     self.works_cache[wid]))
-
                             if self.DEBUG:
                                 log.debug(
                                     '%s: added parent ids to work_listing: %s, [Requests = %s]',
@@ -4167,8 +4803,155 @@ class PartLevels():
         if self.DEBUG:
             log.debug("%s: In work_process_metadata", PLUGIN_NAME)
         log_options = {'log_debug': self.DEBUG, 'log_info': self.INFO}
+        options = config.setting
         if 'metadata' in response.children:
             if 'work' in response.metadata[0].children:
+                work_genres = []
+                all_tags = parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'tag_list',
+                    'tag',
+                    'name',
+                    'text')
+                if options['cwp_genres_use_folks']:
+                    work_genres = all_tags
+                if options['cwp_genres_use_worktype']:
+                    work_type = parse_data(
+                        log_options,
+                        response.metadata[0].work,
+                        [],
+                        'attribs.type')
+                    work_genres += work_type
+                if 'genres' in self.parts[wid]:
+                    self.parts[wid]['genres'] += work_genres
+                else:
+                    self.parts[wid]['genres'] = work_genres
+                key = parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'attribute_list',
+                    'attribute',
+                    'attribs.type:Key',
+                    'text')
+                if 'key' in self.parts[wid]:
+                    self.parts[wid]['key'] += key
+                else:
+                    self.parts[wid]['key'] = key
+                composed_begin_dates = year(parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'relation_list',
+                    'attribs.target_type:artist',
+                    'relation',
+                    'attribs.type:composer',
+                    'begin',
+                    'text'))
+                composed_end_dates = year(parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'relation_list',
+                    'attribs.target_type:artist',
+                    'relation',
+                    'attribs.type:composer',
+                    'end',
+                    'text'))
+                if composed_begin_dates == composed_end_dates:
+                    composed_dates = composed_begin_dates
+                else:
+                    composed_dates = zip(composed_begin_dates, composed_end_dates)
+                    composed_dates = [y + DATE_SEP + z for y, z in composed_dates]
+                if 'composed_dates' in self.parts[wid]:
+                    self.parts[wid]['composed_dates'] += composed_dates
+                else:
+                    self.parts[wid]['composed_dates'] = composed_dates
+                published_begin_dates = year(parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'relation_list',
+                    'attribs.target_type:label',
+                    'relation',
+                    'attribs.type:publishing',
+                    'begin',
+                    'text'))
+                published_end_dates = year(parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'relation_list',
+                    'attribs.target_type:label',
+                    'relation',
+                    'attribs.type:publishing',
+                    'end',
+                    'text'))
+                if published_begin_dates == published_end_dates:
+                    published_dates = published_begin_dates
+                else:
+                    published_dates = zip(published_begin_dates, published_end_dates)
+                    published_dates = [x + DATE_SEP + y for x, y in published_dates]
+                if 'published_dates' in self.parts[wid]:
+                    self.parts[wid]['published_dates'] += published_dates
+                else:
+                    self.parts[wid]['published_dates'] = published_dates
+
+                premiered_begin_dates = year(parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'relation_list',
+                    'attribs.target_type:place',
+                    'relation',
+                    'attribs.type:premiere',
+                    'begin',
+                    'text'))
+                premiered_end_dates = year(parse_data(
+                    log_options,
+                    response.metadata[0].work,
+                    [],
+                    'relation_list',
+                    'attribs.target_type:place',
+                    'relation',
+                    'attribs.type:premiere',
+                    'end',
+                    'text'))
+                if premiered_begin_dates == premiered_end_dates:
+                    premiered_dates = premiered_begin_dates
+                else:
+                    premiered_dates = zip(premiered_begin_dates, premiered_end_dates)
+                    premiered_dates = [x + DATE_SEP + y for x, y in premiered_dates]
+                if 'premiered_dates' in self.parts[wid]:
+                    self.parts[wid]['premiered_dates'] += premiered_dates
+                else:
+                    self.parts[wid]['premiered_dates'] = premiered_dates
+
+                if options['cwp_workdate_include']:
+                    if options['cwp_workdate_source_composed'] and 'composed_dates' in self.parts[wid]:
+                        workdates = self.parts[wid]['composed_dates']
+                    elif options['cwp_workdate_source_published'] and 'published_dates' in self.parts[wid]:
+                        workdates = self.parts[wid]['published_dates']
+                    elif options['cwp_workdate_source_premiered'] and 'premiered_dates' in self.parts[wid]:
+                        workdates = self.parts[wid]['premiered_dates']
+                    else:
+                        workdates = []
+                else:
+                    workdates = []
+                if options['cwp_key_include']:
+                    keys = self.parts[wid]['key']
+                else:
+                    keys = []
+                annotations = keys + workdates
+                if annotations:
+                    if self.parts[wid]['annotations']:
+                        self.parts[wid]['annotations'] += annotations
+                    else:
+                        self.parts[wid]['annotations'] = annotations
+
+
                 if 'artist_locale' in config.setting:
                     locale = config.setting["artist_locale"]
                     # NB this is the Picard code in /util
@@ -4182,24 +4965,18 @@ class PartLevels():
                         'attribs.locale:' + lang,
                         'attribs.primary:primary',
                         'text')
+                    user_tags = parse_data(
+                        log_options,
+                        response.metadata[0].work,
+                        [],
+                        'user_tag_list',
+                        'user_tag',
+                        'name',
+                        'text')
                     if config.setting['cwp_aliases_tags_user']:
-                        tags = parse_data(
-                            log_options,
-                            response.metadata[0].work,
-                            [],
-                            'user_tag_list',
-                            'user_tag',
-                            'name',
-                            'text')
+                        tags = user_tags
                     else:
-                        tags = parse_data(
-                            log_options,
-                            response.metadata[0].work,
-                            [],
-                            'tag_list',
-                            'tag',
-                            'name',
-                            'text')
+                        tags = all_tags
                     if alias:
                         self.parts[wid]['alias'] = self.parts[wid]['name'][:]
                         self.parts[wid]['tags'] = tags
@@ -4229,7 +5006,7 @@ class PartLevels():
                     self.append_tag(
                         tm,
                         '~cwp_error',
-                        'MusicBrainz work xml result not in correct format for work id: ' +
+                        '5. MusicBrainz work xml result not in correct format for work id: ' +
                         unicode(workId))
         return None
 
@@ -4696,6 +5473,7 @@ class PartLevels():
                         if self.INFO:
                             log.info("Track metadata = %s", tm)
                         tm['~cwp_workid_' + unicode(depth)] = workId
+                        self.write_tags(tm, workId, unicode(depth))
                         # strip leading and trailing spaces from work names
                         if isinstance(self.parts[workId]['name'], basestring):
                             worktemp = self.parts[workId]['name'].strip()
@@ -4945,8 +5723,11 @@ class PartLevels():
                     name = tracks[name_type][i]
                     work = name[:common_len]
                     work = work.rstrip(":,.;- ")
-                    removewords = self.options[track]["cwp_removewords_p"].split(
-                        ',')
+                    if self.options[track]["cwp_removewords_p"]:
+                        removewords = self.options[track]["cwp_removewords_p"].split(
+                            ',')
+                    else:
+                        removewords = []
                     if self.INFO:
                         log.info(
                             "Removewords (in %s) = %s",
@@ -5122,7 +5903,7 @@ class PartLevels():
             self.append_tag(
                 tm,
                 '~cwp_warning',
-                'Unable to use level 0 as work name source in level ' +
+                '5. Unable to use level 0 as work name source in level ' +
                 unicode(level) +
                 ' - using hierarchy instead')
 
@@ -5144,7 +5925,22 @@ class PartLevels():
                 parent,
                 part_level)
         tm = track.metadata
+        self.write_tags(tm, workId, part_level)
         if parentId:
+            self.write_tags(tm, parentId, part_level)
+            if 'annotations' in self.parts[workId]:
+                work_annotations = self.parts[workId]['annotations']
+                self.parts[workId]['stripped_annotations'] = work_annotations
+            else:
+                work_annotations = []
+            if 'annotations' in self.parts[parentId]:
+                parent_annotations = self.parts[parentId]['annotations']
+            else:
+                parent_annotations = []
+            if parent_annotations:
+                work_annotations = [z for z in work_annotations if z not in parent_annotations]
+                self.parts[workId]['stripped_annotations'] = work_annotations
+
 
             tm['~cwp_workid_' + unicode(part_level)] = parentId
             tm['~cwp_work_' + unicode(part_level)] = parent
@@ -5207,6 +6003,13 @@ class PartLevels():
             self.parts[workId]['stripped_name'] = stripped_works
         if self.DEBUG:
             log.debug("GOT TO END OF SET_METADATA")
+
+    def write_tags(self, tm, workId, part_level):
+        self.append_tag(tm, '~cwp_candidate_genres', self.parts[workId]['genres'])
+        self.append_tag(tm, '~cwp_keys', self.parts[workId]['key'])
+        self.append_tag(tm, '~cwp_composed_dates', self.parts[workId]['composed_dates'])
+        self.append_tag(tm, '~cwp_published_dates', self.parts[workId]['published_dates'])
+        self.append_tag(tm, '~cwp_premiered_dates', self.parts[workId]['premiered_dates'])
 
     def derive_from_title(self, track, title):
         """
@@ -5369,6 +6172,20 @@ class PartLevels():
                         tm['~cwp_work_' + unicode(lev)] += " (" + options["cwp_medley_text"] + \
                             ' ' + ', '.join(medley_list) + ")"
 
+        # add any annotations for dates and keys
+        if options['cwp_workdate_include'] or options['cwp_key_include']:
+            for lev in range(0, part_levels + 1):
+                if '~cwp_workid_' + unicode(lev) in tm:
+                    tup_id = interpret(tm['~cwp_workid_' + unicode(lev)])
+                    if 'annotations' in self.parts[tup_id]:
+                        tm['~cwp_work_' + unicode(lev)] += "; (" + ', '.join(self.parts[tup_id]['annotations']) + ")"
+                        if lev < part_levels:
+                            if 'stripped_annotations' in self.parts[tup_id]:
+                                if self.parts[tup_id]['stripped_annotations']:
+                                    tm['~cwp_part_' + unicode(lev)] += "; (" + ', '.join(
+                                        self.parts[tup_id]['stripped_annotations']) + ")"
+
+
         part = []
         work = []
         for level in range(0, part_levels):
@@ -5393,7 +6210,6 @@ class PartLevels():
 
         # set up group heading and part
         if part_levels > 0:
-
             groupheading = work[1]
             work_main = work[ref_level]
             inter_work = ""
@@ -5524,7 +6340,7 @@ class PartLevels():
                                     addn_part[r] + ext_inter_work
                             ext_groupheading = work[ref_level] + \
                                 addn_work[ref_level - 1] + ':: ' + ext_inter_work
-                        if title_depth > 1:
+                        if title_depth > 1 and ref_level > 1:
                             for r in range(1, min(title_depth, ref_level)):
                                 if inter_title_work:
                                     inter_title_work = ': ' + inter_title_work
@@ -5621,6 +6437,22 @@ class PartLevels():
             del tm['~cwp_groupheading']
         if '~cwp_title_groupheading' in tm and tm['~cwp_title_groupheading'] == tm['~cwp_title_part']:
             del tm['~cwp_title_groupheading']
+        # clean up groupheadings (may be stray separators if level 0  or title options used)
+        if '~cwp_groupheading' in tm:
+            tm['~cwp_groupheading'] = tm['~cwp_groupheading'].strip(
+                ':').strip(
+                options['cwp_single_work_sep']).strip(
+                options['cwp_multi_work_sep'])
+        if '~cwp_extended_groupheading' in tm:
+           tm['~cwp_extended_groupheading'] =  tm['~cwp_extended_groupheading'].strip(
+               ':').strip(
+               options['cwp_single_work_sep']).strip(
+               options['cwp_multi_work_sep'])
+        if '~cwp_title_groupheading' in tm:
+           tm['~cwp_title_groupheading'] =  tm['~cwp_title_groupheading'].strip(
+               ':').strip(
+               options['cwp_single_work_sep']).strip(
+               options['cwp_multi_work_sep'])
         if self.DEBUG:
             log.debug("....done")
         return None
@@ -5755,7 +6587,7 @@ class PartLevels():
                     self.append_tag(
                         tm,
                         '~cwp_warning',
-                        'Tag ' +
+                        '6. Tag ' +
                         tag +
                         ' has multiple contents')
                 self.append_tag(tm, tag, inter_work + work_sep + " " + pt)
@@ -5810,7 +6642,7 @@ class PartLevels():
             self.cwp_options = collections.defaultdict(
                 lambda: collections.defaultdict(dict))
 
-            for opt in plugin_options('workparts'):
+            for opt in plugin_options('workparts') + plugin_options('genres'):
                 if 'name' in opt:
                     if 'value' in opt:
                         if options[opt['option']]:
@@ -5833,9 +6665,13 @@ class PartLevels():
                         json.dumps(
                             self.cwp_options)))
         if self.ERROR and "~cwp_error" in tm:
-            self.append_tag(tm, '001_errors', tm['~cwp_error'])
+            for error in str_to_list(tm['~cwp_error']):
+                code = error[0]
+                self.append_tag(tm, '001_errors:' + code, error)
         if self.WARNING and "~cwp_warning" in tm:
-            self.append_tag(tm, '002_warnings', tm['~cwp_warning'])
+            for warning in str_to_list(tm['~cwp_warning']):
+                wcode = warning[0]
+            self.append_tag(tm, '002_warnings:' + wcode, warning)
 
     def append_tag(self, tm, tag, source, sep=None):
         """
@@ -5954,17 +6790,19 @@ class PartLevels():
                 stripped_work = work
         if extend and stripped_work == work:
             # try just stripping only the first portion
-            common_dets = longest_common_sequence(parent, work)
+            words = re.compile(r"[\w]+|[\W]")
+            parent_words = words.findall(parent)
+            work_words = words.findall(work)
+            common_dets = longest_common_sequence(parent_words, work_words)
             common_seq = common_dets['sequence']
             seq_length = common_dets['length']
             if self.INFO:
                 log.info(
                     'Checking common sequence between parent and work. Longest sequence = %s',
                     common_seq)
-            if seq_length > 2 and ' ' in common_seq:  # Make sure it is non-trivial
+            if seq_length > 0:  # Make sure it is non-trivial
                 # self.strip_parent_from_work(work, common_seq, part_level, False)[0]
-                stripped_work = work.replace(common_seq, '', 1).lstrip(''
-                                                                       ':,-')
+                stripped_work = ''.join(work_words[seq_length:]).lstrip(' :,-')
         if self.INFO:
             log.info("Work: %s", work)
         if self.INFO:
@@ -6005,7 +6843,10 @@ class PartLevels():
         # Matches positive integers with punctuation
         p2 = re.compile(r'^\W*\d+[.):-]')
         # remove certain words from the comparison
-        removewords = self.options[track]["cwp_removewords_p"].split(',')
+        if self.options[track]["cwp_removewords_p"]:
+            removewords = self.options[track]["cwp_removewords_p"].split(',')
+        else:
+            removewords = []
         if self.INFO:
             log.info("Removewords = %s", removewords)
         # remove numbers, roman numerals, part etc and punctuation from the
@@ -6053,7 +6894,7 @@ class PartLevels():
                 self.append_tag(
                     tm,
                     '~cwp_error',
-                    'Error in replacement format for replacement ' +
+                    '6. Error in replacement format for replacement ' +
                     rep)
         if self.INFO:
             log.info("Replacement: %s", replacements)
@@ -6073,7 +6914,7 @@ class PartLevels():
                         self.append_tag(
                             tm,
                             '~cwp_error',
-                            'Synonym entries must not be blank - error in ' +
+                            '7. Synonym entries must not be blank - error in ' +
                             syn)
                         tup[i] = "**BAD**"
                     elif re.findall(r'[^\w|\&]+', tup[i], re.UNICODE):
@@ -6083,7 +6924,7 @@ class PartLevels():
                         self.append_tag(
                             tm,
                             '~cwp_error',
-                            'Synonyms must be single words without punctuation - error in ' +
+                            '7. Synonyms must be single words without punctuation - error in ' +
                             syn)
                         tup[i] = "**BAD**"
                 if "**BAD**" in tup:
@@ -6097,7 +6938,7 @@ class PartLevels():
                 self.append_tag(
                     tm,
                     '~cwp_error',
-                    'Error in synonym format for synonym ' +
+                    '7. Error in synonym format for synonym ' +
                     syn)
         if self.INFO:
             log.info("Synonyms: %s", synonyms)
@@ -6545,6 +7386,7 @@ class PartLevels():
         return ' '.join(resultwords)
 
 
+
 ################
 # OPTIONS PAGE #
 ################
@@ -6555,7 +7397,7 @@ class ClassicalExtrasOptionsPage(OptionsPage):
     TITLE = "Classical Extras"
     PARENT = "plugins"
     opts = plugin_options('artists') + plugin_options('tag') +\
-           plugin_options('workparts') + plugin_options('other')
+           plugin_options('workparts') + plugin_options('genres') + plugin_options('other')
 
     options = []
 
@@ -6567,7 +7409,7 @@ class ClassicalExtrasOptionsPage(OptionsPage):
                 default = ""
             if opt['type'] == 'Boolean':
                 options.append(BoolOption("setting", opt['option'], default))
-            elif opt['type'] == 'Text' or opt['type'] == 'Combo':
+            elif opt['type'] == 'Text' or opt['type'] == 'Combo' or opt['type'] == 'PlainText':
                 options.append(TextOption("setting", opt['option'], default))
             elif opt['type'] == 'Integer':
                 options.append(IntOption("setting", opt['option'], default))
@@ -6587,17 +7429,19 @@ class ClassicalExtrasOptionsPage(OptionsPage):
         :return:
         """
         opts = plugin_options('artists') + plugin_options('tag') + \
-               plugin_options('workparts') + plugin_options('other')
+               plugin_options('workparts') + plugin_options('genres') + plugin_options('other')
 
         # To force a toggle so that signal given
         toggle_list = ['use_cwp',
                        'use_cea',
                        'cea_override',
+                       'cwp_override',
                        'cea_ra_use',
                        'cea_split_lyrics',
                        'cwp_partial',
                        'cwp_arrangements',
-                       'cwp_medley']
+                       'cwp_medley',
+                       'cwp_use_muso_refdb',]
         # count = 0
         for opt in opts:
             if opt['option'] == 'classical_work_parts':
@@ -6616,6 +7460,9 @@ class ClassicalExtrasOptionsPage(OptionsPage):
             elif opt['type'] == 'Text':
                 self.ui.__dict__[ui_name].setText(
                     self.config.setting[opt['option']])
+            elif opt['type'] == 'PlainText':
+                self.ui.__dict__[ui_name].setPlainText(
+                    self.config.setting[opt['option']])
             elif opt['type'] == 'Combo':
                 self.ui.__dict__[ui_name].setEditText(
                     self.config.setting[opt['option']])
@@ -6629,7 +7476,7 @@ class ClassicalExtrasOptionsPage(OptionsPage):
 
     def save(self):
         opts = plugin_options('artists') + plugin_options('tag') + \
-               plugin_options('workparts') + plugin_options('other')
+               plugin_options('workparts') + plugin_options('genres') + plugin_options('other')
 
         for opt in opts:
             if opt['option'] == 'classical_work_parts':
@@ -6644,6 +7491,9 @@ class ClassicalExtrasOptionsPage(OptionsPage):
             elif opt['type'] == 'Text':
                 self.config.setting[opt['option']] = unicode(
                     self.ui.__dict__[ui_name].text())
+            elif opt['type'] == 'PlainText':
+                self.config.setting[opt['option']] = unicode(
+                    self.ui.__dict__[ui_name].toPlainText())
             elif opt['type'] == 'Combo':
                 self.config.setting[opt['option']] = unicode(
                     self.ui.__dict__[ui_name].currentText())
@@ -6669,7 +7519,19 @@ config.setting['ce_options_overwrite'] = False
 config.setting['track_ars'] = True
 config.setting['release_ars'] = True
 
-
+REF_DICT = get_references_from_file(config.setting['cwp_muso_path'], config.setting['cwp_muso_refdb'])
+COMPOSER_DICT = REF_DICT['composers']
+if config.setting['cwp_muso_classical'] and not COMPOSER_DICT:
+    log.error('No composer roster found')
+for cd in COMPOSER_DICT:
+    cd['lc_name'] = [c.lower() for c in cd['name']]
+    cd['lc_sort'] = [c.lower() for c in cd['sort']]
+PERIOD_DICT = REF_DICT['periods']
+if (config.setting['cwp_muso_dates'] or config.setting['cwp_muso_periods']) and not PERIOD_DICT:
+    log.error('No period map found')
+GENRE_DICT = REF_DICT['genres']
+if config.setting['cwp_muso_genres'] and not GENRE_DICT:
+    log.error('No classical genre list found')
 register_track_metadata_processor(PartLevels().add_work_info)
 register_track_metadata_processor(ExtraArtists().add_artist_info)
 register_options_page(ClassicalExtrasOptionsPage)
