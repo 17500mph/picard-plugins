@@ -31,7 +31,8 @@ inconsistencies in the MusicBrainz data (e.g. include English titles from the tr
 are in the composer's language and/or script).
 Also existing file tags can be processed (not possible in native Picard) or cleared without affecting cover art.
 <br /><br />
-See the readme file for full details
+See the readme file <a href="https://github.com/metabrainz/picard-plugins/tree/1.0/plugins/classical_extras">
+on GitHub here</a> for full details.
 """
 
 ########################
@@ -56,7 +57,7 @@ See the readme file for full details
 #
 # The main control routine is at the end of the module
 
-PLUGIN_VERSION = '0.9.2'
+PLUGIN_VERSION = '0.9.3'
 PLUGIN_API_VERSIONS = ["1.4.0", "1.4.2"]
 PLUGIN_LICENSE = "GPL-2.0"
 PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
@@ -75,20 +76,176 @@ from datetime import datetime
 import collections
 import re
 import unicodedata
-# import traceback
+import time
 import json
 import copy
 import os
+import itertools
+import codecs  # needed for Python 2.7
 from PyQt4.QtCore import QXmlStreamReader
 from picard.file import File
 from picard.track import Track
 from picard.tagger import Tagger
-from itertools import chain
+from picard.const import USER_DIR
+import suffixtree
+import operator
 
 
 ##########################
 # MODULE-WIDE COMPONENTS #
 ##########################
+
+# LOGGING
+
+# If logging occurs before any album is loaded, the startup log file will be written
+log_files = collections.defaultdict(dict)
+# entries are release-ids: to keep track of which log files are open
+release_status = collections.defaultdict(dict)
+# release_status[release_id]['works'] = True indicates that we are still processing works for release_id
+# & similarly for 'artists'
+# release_status[release_id]['start'] holds start time of release processing
+# release_status[release_id]['name'] holds the album name
+# release_status[release_id]['lookups'] holds number of lookups for this release
+# release_status[release_id]['file_objects'] holds a cumulative list of file objects (tagger seems a bit unreliable)
+# release_status[release_id]['file_found'] = False indicates that "No file with matching trackid" has (yet) been found
+
+def write_log(release_id, log_type, message, *args):
+    """
+    Custom logging function - if log_info is set, all messages will be written to a custom file in a 'Classical_Extras'
+    subdirectory in the same directory as the main Picard log. A different file is used for each album,
+    to aid in debugging - the log file is release_id.log. Any startup messages (i.e. before a release has been loaded)
+    are written to startup.log
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
+    :param log_type: 'error', 'warning', 'debug' or 'info'
+    :param message: string, e.g. 'error message for workid: %s'
+    :param args: arguments for parameters in string, e.g. if workId then str(workId) will replace %s in the above
+    :return:
+    """
+    options = config.setting
+    if not (isinstance(message, str) or isinstance(message, unicode)):
+        msg = repr(message)
+    else:
+        msg = message
+    if args:
+        msg = msg % args
+
+    if options["log_info"] or log_type == "basic":
+        # if log_info is True, all log messages will be written to the custom log, regardless of other log_... settings
+        # basic session log will always be written (summary of releases and processing times)
+        filename = release_id + ".log"
+        log_dir = os.path.join(USER_DIR, "Classical_Extras")
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        if release_id not in log_files:
+            try:
+                if release_id == 'session':
+                    log_file = codecs.open(os.path.join(log_dir, filename), 'w', encoding='utf8', buffering=0)
+                    # buffering=0 so that session log (low volume) is up to date even if not closed
+                else:
+                    log_file = codecs.open(os.path.join(log_dir, filename), 'w', encoding='utf8')
+                    # default buffering for speed
+                # need codecs for python 2.7 to write unicode
+                log_files[release_id] = log_file
+                log_file.write(PLUGIN_NAME + ' Version:' + PLUGIN_VERSION + '\n')
+                if release_id == 'session':
+                    log_file.write('session' + '\n')
+                else:
+                    log_file.write('Release id: ' + release_id + '\n')
+                    if release_id in release_status and 'name' in release_status[release_id]:
+                        log_file.write('Album name: ' + release_status[release_id]['name'] + '\n')
+            except IOError:
+                log.error('Unable to open file %s for writing log', filename)
+                return
+        else:
+            log_file = log_files[release_id]
+        try:
+            log_file.write(log_type[0].upper() + ': ')
+            log_file.write(str(datetime.now()) + ' : ')
+            log_file.write(msg)
+            log_file.write("\n")
+        except IOError:
+            log.error('Unable to write to log file %s', filename)
+            return
+    # Only debug, warning and error messages will be written to the main Picard log, if those options have been set
+    if log_type != 'info' and log_type != 'basic':  # i.e. non-custom log items
+        message2 = PLUGIN_NAME + ': ' + message
+    else:
+        message2 = message
+    if log_type == 'debug' and options["log_debug"]:
+        if release_id in release_status and 'debug' in release_status[release_id]:
+            add_list_uniquely(release_status[release_id]['debug'], msg)
+        else:
+            release_status[release_id]['debug'] = [msg]
+        if args:
+            log.debug(message2, *args)
+        else:
+            log.debug(message2)
+    if log_type == 'warning' and options["log_warning"]:
+        if release_id in release_status and 'warnings' in release_status[release_id]:
+            add_list_uniquely(release_status[release_id]['warnings'], msg)
+        else:
+            release_status[release_id]['warnings'] = [msg]
+        if args:
+            log.warning(message2, *args)
+        else:
+            log.warning(message2)
+    if log_type == 'error' and options["log_error"]:
+        if release_id in release_status and 'errors' in release_status[release_id]:
+            add_list_uniquely(release_status[release_id]['errors'], msg)
+        else:
+            release_status[release_id]['errors'] = [msg]
+        if args:
+            log.error(message2, *args)
+        else:
+            log.error(message2)
+
+
+def close_log(release_id, caller):
+    # close the custom log file if we are done
+    if release_id == 'session':   # shouldn't happen but, just in case, don't close the session log
+        return
+    if caller in ['works', 'artists']:
+        release_status[release_id][caller] = False
+    if (caller == 'works' and release_status[release_id]['artists']) or \
+            (caller == 'artists' and release_status[release_id]['works']):
+        log.error('exiting close_log. only %s done', caller)
+        return
+    duration = 'N/A'
+    lookups = 'N/A'
+    if release_id in release_status:
+        duration = datetime.now() - release_status[release_id]['start']
+        lookups = release_status[release_id]['lookups']
+        del release_status[release_id]['start']
+        del release_status[release_id]['lookups']
+    if release_id in log_files:
+        write_log(release_id, 'info', 'Duration = %s. Number of lookups = %s.', duration, lookups)
+        write_log(release_id, 'info', 'Closing log file for %s', release_id)
+        log_files[release_id].close()
+        del log_files[release_id]
+    if 'session' in log_files and release_id in release_status:
+        write_log('session', 'basic', '\n Completed processing release id %s. Details below:-', release_id)
+        if 'name' in release_status[release_id]:
+            write_log('session', 'basic', 'Album name %s', release_status[release_id]['name'])
+        if 'errors' in release_status[release_id]:
+            write_log('session', 'basic', '-------------------- Errors --------------------')
+            for error in release_status[release_id]['errors']:
+                write_log('session', 'basic', error)
+            del release_status[release_id]['errors']
+        if 'warnings' in release_status[release_id]:
+            write_log('session', 'basic', '-------------------- Warnings --------------------')
+            for warning in release_status[release_id]['warnings']:
+                write_log('session', 'basic', warning)
+            del release_status[release_id]['warnings']
+        if 'debug' in release_status[release_id]:
+            write_log('session', 'basic', '-------------------- Debug log --------------------')
+            for debug in release_status[release_id]['debug']:
+                write_log('session', 'basic', debug)
+            del release_status[release_id]['debug']
+        write_log('session', 'basic', 'Duration = %s. Number of lookups = %s.', duration, lookups)
+    if release_id in release_status:
+        del release_status[release_id]
+
 
 # CONSTANTS
 _node_name_re = re.compile('[^a-zA-Z0-9]')
@@ -125,9 +282,10 @@ def _read_xml(stream):
     return document
 
 
-def parse_data(options, obj, response_list, *match):
+def parse_data(release_id, obj, response_list, *match):
     """
-    :param options:
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param obj: an XmlNode object, list or dictionary containing nodes
     :param response_list: working memory for recursive calls
     :param match: list of items to search for in node (see detailed notes below
@@ -143,25 +301,22 @@ def parse_data(options, obj, response_list, *match):
       (Note: childname can be a dot-list if the text is more than one level down - e.g. child1.child2)
       # TODO - Check this works fully
     """
-
-    DEBUG = False  # options["log_debug"]
-    INFO = False  # options["log_info"]
+    DEBUG = False  # config.setting["log_debug"]
+    INFO = False  # config.setting["log_info"]
     # Over-ridden options as these can be VERY wordy
 
     # XmlNode instances are not iterable, so need to convert to dict
     if isinstance(obj, XmlNode):
         obj = obj.__dict__
-    if DEBUG:
-        log.debug('%s: parsing data - looking for %s', PLUGIN_NAME, match)
+    if DEBUG or INFO:
+        write_log(release_id, 'debug', 'Parsing data - looking for %s', match)
     if INFO:
-        log.info('looking in %s', obj)
+        write_log(release_id, 'info', 'looking in %s', obj)
     if isinstance(obj, list):
         for item in obj:
             if isinstance(item, XmlNode):
                 item = item.__dict__
-            parse_data(options, item, response_list, *match)
-        if INFO:
-            log.info('response_list: %s', response_list)
+            parse_data(release_id, item, response_list, *match)
         return response_list
     elif isinstance(obj, dict):
         if match[0] in obj:
@@ -171,15 +326,14 @@ def parse_data(options, obj, response_list, *match):
             else:
                 match_list = list(match)
                 match_list.pop(0)
-                parse_data(
-                    options, obj[match[0]], response_list, *match_list)
+                parse_data(release_id, obj[match[0]], response_list, *match_list)
             if INFO:
-                log.info('response_list: %s', response_list)
+                write_log(release_id, 'info', 'response_list: %s', response_list)
             return response_list
         elif '.' in match[0]:
             test = match[0].split(':')
             match2 = test[0].split('.')
-            test_data = parse_data(options, obj, [], *match2)
+            test_data = parse_data(release_id, obj, [], *match2)
             if len(test) > 1:
                 if test[1] in test_data:
                     if len(match) == 1:
@@ -188,35 +342,40 @@ def parse_data(options, obj, response_list, *match):
                     else:
                         match_list = list(match)
                         match_list.pop(0)
-                        parse_data(
-                            options, obj, response_list, *match_list)
+                        parse_data(release_id, obj, response_list, *match_list)
             else:
-                parse_data(options, obj, response_list, *match2)
+                parse_data(release_id, obj, response_list, *match2)
             if INFO:
-                log.info('response_list: %s', response_list)
+                write_log(release_id, 'info', 'response_list: %s', response_list)
             return response_list
         else:
             if 'children' in obj:
-                parse_data(
-                    options, obj['children'], response_list, *match)
+                parse_data(release_id, obj['children'], response_list, *match)
             if INFO:
-                log.info('response_list: %s', response_list)
+                write_log(release_id, 'info', 'response_list: %s', response_list)
             return response_list
     else:
         if INFO:
-            log.info('response_list: %s', response_list)
+            write_log(release_id, 'info', 'response_list: %s', response_list)
         return response_list
 
-def create_dict_from_ref_list(options, ref_list, keys, tags):
+def create_dict_from_ref_list(options, release_id, ref_list, keys, tags):
     ref_dict_list = []
     for refs in ref_list:
         for ref in refs:
-            parsed_refs = [parse_data(options, ref, [], t, 'text') for t in tags]
+            parsed_refs = [parse_data(release_id, ref, [], t, 'text') for t in tags]
             ref_dict_list.append(dict(zip(keys, parsed_refs)))
     return ref_dict_list
 
 
-def get_references_from_file(path, filename):
+def get_references_from_file(release_id, path, filename):
+    """
+    Lookup Muso Reference.xml or similar
+    :param release_id: name of log file
+    :param path: Reference file path
+    :param filename: Reference file name
+    :return:
+    """
     options = config.setting
     composer_dict_list = []
     period_dict_list = []
@@ -227,29 +386,26 @@ def get_references_from_file(path, filename):
         xml_file.close()
         document = _read_xml(QXmlStreamReader(reply))
         # Composers
-        composer_list = parse_data(options, document, [], 'ReferenceDB', 'Composer')
+        composer_list = parse_data(release_id, document, [], 'ReferenceDB', 'Composer')
         keys = ['name', 'sort', 'birth', 'death', 'country', 'core']
         tags = ['Name', 'Sort', 'Birth', 'Death', 'CountryCode', 'Core']
-        composer_dict_list = create_dict_from_ref_list(options, composer_list, keys, tags)
+        composer_dict_list = create_dict_from_ref_list(options, release_id, composer_list, keys, tags)
         # Periods
-        period_list = parse_data(options, document, [], 'ReferenceDB', 'ClassicalPeriod')
+        period_list = parse_data(release_id, document, [], 'ReferenceDB', 'ClassicalPeriod')
         keys = ['name', 'start', 'end']
         tags = ['Name', 'Start_x0020_Date', 'End_x0020_Date']
-        period_dict_list = create_dict_from_ref_list(options, period_list, keys, tags)
+        period_dict_list = create_dict_from_ref_list(options, release_id, period_list, keys, tags)
         # Genres
-        genre_list = parse_data(options, document, [], 'ReferenceDB', 'ClassicalGenre')
+        genre_list = parse_data(release_id, document, [], 'ReferenceDB', 'ClassicalGenre')
         keys = ['name']
         tags = ['Name']
-        genre_dict_list = create_dict_from_ref_list(options, genre_list, keys, tags)
+        genre_dict_list = create_dict_from_ref_list(options, release_id, genre_list, keys, tags)
 
     except IOError:
         if options['cwp_muso_genres'] or options['cwp_muso_classical'] or options['cwp_muso_dates'] or options['cwp_muso_periods']:
-            log.error('File %s does not exist or is corrupted', os.path.join(path, file))
+            write_log(release_id, 'error', 'File %s does not exist or is corrupted', os.path.join(path, file))
     finally:
         return {'composers': composer_dict_list, 'periods': period_dict_list, 'genres': genre_dict_list}
-
-
-
 
 prefixes = ['the', 'a', 'an', 'le', 'la', 'les', 'los', 'il']
 
@@ -294,17 +450,19 @@ RELATION_TYPES = {
         'orchestrator',
         'vocal arranger']}
 
-
 # OPTIONS
 
-def get_options(album, track):
+def get_options(release_id, album, track):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param album: current release
     :param track: current track
     :return: None (result is passed via tm)
     A common function for both Artist and Workparts, so that the first class to process a track will execute
     this function so that the results are available to both (via a track metadata item)
     """
+    release_status[release_id]['done'] = False
     set_options = collections.defaultdict(dict)
     sections = ['artists', 'workparts']
     override = {
@@ -321,6 +479,7 @@ def get_options(album, track):
     else:
         set_options[track] = option_settings(
             album.tagger.config.setting)  # make a copy
+        write_log(release_id, 'info', 'Default (i.e. per UI) options for track %s are %r', track, set_options[track])
 
     # As we use some of the main Picard options and may over-write them, save them here
     # set_options[track]['translate_artist_names'] = config.setting['translate_artist_names']
@@ -328,95 +487,127 @@ def get_options(album, track):
 
     options = set_options[track]
     tm = track.metadata
+    new_metadata = None
     orig_metadata = None
     # Only look up files if needed
     file_options = {}
     music_file = ''
     music_file_found = None
-    found_file = False
+    release_status[release_id]['file_found'] = False
     start = datetime.now()
-    if options['log_info']:
-        log.info('Clock start at %s', start)
-    for music_file in album.tagger.files:
-        new_metadata = album.tagger.files[music_file].metadata
-        orig_metadata = album.tagger.files[music_file].orig_metadata
+    write_log(release_id, 'info', 'Clock start at %s', start)
+    trackno = tm['tracknumber']
+    discno = tm['discnumber']
 
+    album_filenames = album.tagger.get_files_from_objects([album])
+    write_log(release_id, 'info', 'No. of album files found = %s', len(album_filenames))
+    # Note that sometimes Picard fails to get all the file objects, even if they are there (network issues)
+    # so we will cache whatever we can get!
+    if release_id in release_status and 'file_objects' in release_status[release_id]:
+        add_list_uniquely(release_status[release_id]['file_objects'], album_filenames)
+    else:
+        release_status[release_id]['file_objects'] = album_filenames
+    write_log(release_id, 'info', 'No. of album files cached = %s', len(release_status[release_id]['file_objects']))
+    track_file = None
+    for album_file in release_status[release_id]['file_objects']:
+        write_log(release_id, 'info', 'Track file = %s, tracknumber = %s, discnumber = %s. Metadata trackno = %s, discno = %s',
+                  album_file.filename, str(album_file.tracknumber), str(album_file.discnumber), trackno, discno)
+        if str(album_file.tracknumber) == trackno and str(album_file.discnumber) == discno:
+            write_log(release_id, 'info', 'Track file found = %r', album_file.filename)
+            track_file = album_file.filename
+            break
+
+
+    # Note: It would have been nice to do a rough check beforehand of total tracks,
+    # but ~totalalbumtracks is not yet populated
+    if not track_file:
+        album_fullnames = [x.filename for x in release_status[release_id]['file_objects']]
+        write_log(release_id, 'info', 'Album files found = %r', album_fullnames)
+        for music_file in album_fullnames:
+            new_metadata = album.tagger.files[music_file].metadata
+
+            if 'musicbrainz_trackid' in new_metadata and 'musicbrainz_trackid' in tm:
+                if new_metadata['musicbrainz_trackid'] == tm['musicbrainz_trackid']:
+                    track_file = music_file
+                    break
+        # Nothing found...
+        if new_metadata and 'musicbrainz_trackid' not in new_metadata:
+            if options['log_warning']:
+                write_log(release_id, 'warning', 'No trackid in file %s', music_file)
+        if 'musicbrainz_trackid' not in tm:
+            if options['log_warning']:
+                write_log(release_id, 'warning', 'No trackid in track %s', track)
+    """ 
+    Note that, on initial load, new_metadata == orig_metadata; but, after refresh, new_metadata will have 
+    the same track metadata as tm (plus the file metadata as per orig_metadata), so a trackid match
+    is then possible for files that do not have musicbrainz_trackid in orig_metadata. That is why 
+    new_metadata is used in the above test, rather than orig_metadata, but orig_metadata is then used below
+    to get the saved options.
+    """
+
+    # Find the tag with the options:-
+    if track_file:
+        orig_metadata = album.tagger.files[track_file].orig_metadata
+        music_file_found = track_file
         if options['log_info']:
-            log.info('orig_metadata for file %s is', music_file)
-            log.info(orig_metadata)
-        if 'musicbrainz_trackid' in new_metadata and 'musicbrainz_trackid' in tm:
-            if new_metadata['musicbrainz_trackid'] == tm['musicbrainz_trackid']:
-                # find the tag with the options
-                for section in sections:
-                    if options[override[section]]:
-                        if options[prefix[section] + '_options_tag'] + ':' + \
-                                section + '_options' in orig_metadata:
+            write_log(release_id, 'info', 'orig_metadata for file %s is', music_file)
+            write_log(release_id, 'info', orig_metadata)
+        for section in sections:
+            if options[override[section]]:
+                if options[prefix[section] + '_options_tag'] + ':' + \
+                        section + '_options' in orig_metadata:
+                    file_options[section] = interpret(
+                        orig_metadata[options[prefix[section] + '_options_tag'] + ':' + section + '_options'])
+                elif options[prefix[section] + '_options_tag'] in orig_metadata:
+                    options_tag_contents = orig_metadata[options[prefix[section] + '_options_tag']]
+                    if isinstance(options_tag_contents, list):
+                        options_tag_contents = options_tag_contents[0]
+                    combined_options = ''.join(options_tag_contents.split(
+                        '(workparts_options)')).split('(artists_options)')
+                    for i, _ in enumerate(combined_options):
+                        combined_options[i] = interpret(
+                            combined_options[i].lstrip('; '))
+                        if isinstance(
+                                combined_options[i],
+                                dict) and 'Classical Extras' in combined_options[i]:
+                            if sect_text[section] + \
+                                    ' options' in combined_options[i]['Classical Extras']:
+                                file_options[section] = combined_options[i]
+                else:
+                    for om in orig_metadata:
+                        if ':' + section + '_options' in om:
                             file_options[section] = interpret(
-                                orig_metadata[options[prefix[section] + '_options_tag'] + ':' + section + '_options'])
-                        elif options[prefix[section] + '_options_tag'] in orig_metadata:
-                            options_tag_contents = orig_metadata[options[prefix[section] + '_options_tag']]
-                            if isinstance(options_tag_contents, list):
-                                options_tag_contents = options_tag_contents[0]
-                            combined_options = ''.join(options_tag_contents.split(
-                                '(workparts_options)')).split('(artists_options)')
-                            for i, _ in enumerate(combined_options):
-                                combined_options[i] = interpret(
-                                    combined_options[i].lstrip('; '))
-                                if isinstance(
-                                        combined_options[i],
-                                        dict) and 'Classical Extras' in combined_options[i]:
-                                    if sect_text[section] + \
-                                            ' options' in combined_options[i]['Classical Extras']:
-                                        file_options[section] = combined_options[i]
-                        else:
-                            for om in orig_metadata:
-                                if ':' + section + '_options' in om:
-                                    file_options[section] = interpret(
-                                        orig_metadata[om])
-                        if section not in file_options or not file_options[section]:
-                            if options['log_error']:
-                                log.error(
-                                    '%s: Saved ' +
-                                    section +
-                                    ' options cannot be read for file %s. Using current settings',
-                                    PLUGIN_NAME,
-                                    music_file)
-                            append_tag(
-                                tm,
-                                '~' + prefix[section] + '_error',
-                                '1. Saved ' +
-                                section +
-                                ' options cannot be read. Using current settings')
+                                orig_metadata[om])
+                if section not in file_options or not file_options[section]:
+                    if options['log_error']:
+                        write_log(release_id, 'error', 'Saved ' +
+                                  section +
+                                  ' options cannot be read for file %s. Using current settings',
+                                  music_file)
+                    append_tag(release_id, tm, '~' + prefix[section] + '_error', '1. Saved ' +
+                               section +
+                               ' options cannot be read. Using current settings')
 
-                found_file = True
-                music_file_found = music_file
-                break  # we've found the file and don't want any more!
-        else:
-            if 'musicbrainz_trackid' not in new_metadata:
-                if options['log_warning']:
-                    log.warning('No trackid in file %s', music_file)
-            if 'musicbrainz_trackid' not in tm:
-                if options['log_warning']:
-                    log.warning('No trackid in track %s', track)
+        release_status[release_id]['file_found'] = True
 
     end = datetime.now()
     if options['log_info']:
-        log.info('Clock end at %s', end)
-        log.info('Duration = %s', end - start)
+        write_log(release_id, 'info', 'Clock end at %s', end)
+        write_log(release_id, 'info', 'Duration = %s', end - start)
 
-    if not found_file:
+    if not release_status[release_id]['file_found']:
         if options['log_warning']:
-            log.warning(
-                "No file with matching trackid for track %s. IF THERE SHOULD BE ONE, TRY 'REFRESH'",
-                track)
-        append_tag(
-            tm,
-            "002_important_warning",
-            "No file with matching trackid - IF THERE SHOULD BE ONE, TRY 'REFRESH' - "
-            "(unable to process any saved options, lyrics or 'keep' tags)")
+            write_log(release_id, 'warning',
+                      "No file with matching trackid for track %s. IF THERE SHOULD BE ONE, TRY 'REFRESH'", track)
+        append_tag(release_id, tm, "002_important_warning",
+                   "No file with matching trackid - IF THERE SHOULD BE ONE, TRY 'REFRESH' - "
+                   "(unable to process any saved options, lyrics or 'keep' tags)")
+        # Nothing else is done with this info as yet - ideally we need to refresh and re-run
+        # for all releases where release_status[release_id]['file_prob'] == True
+
     else:
         if options['log_info']:
-            log.info('Found music file: %r', music_file_found)
+            write_log(release_id, 'info', 'Found music file: %r', music_file_found)
         for section in sections:
             if options[override[section]]:
                 if section in file_options and file_options[section]:
@@ -424,23 +615,19 @@ def get_options(album, track):
                         options_dict = file_options[section]['Classical Extras'][sect_text[section] + ' options']
                     except TypeError:
                         if options['log_error']:
-                            log.error(
-                                '%s: Saved ' +
-                                section +
-                                ' options cannot be read for file %s. Using current settings',
-                                PLUGIN_NAME,
-                                music_file)
-                        append_tag(
-                            tm,
-                            '~' + prefix[section] + '_error',
-                            '1. Saved ' +
-                            section +
-                            ' options cannot be read. Using current settings')
+                            write_log(release_id, 'error', 'Saved ' +
+                                      section +
+                                      ' options cannot be read for file %s. Using current settings',
+                                      music_file)
+                        append_tag(release_id, tm, '~' + prefix[section] + '_error', '1. Saved ' +
+                                   section +
+                                   ' options cannot be read. Using current settings')
                         break
                     for opt in options_dict:
                         if isinstance(
                                 options_dict[opt],
                                 dict) and options[override['tagmap']]:  # for tag line options
+                            # **NB tag mapping lines are the only entries of type dict**
                             opt_list = []
                             for opt_item in options_dict[opt]:
                                 opt_list.append(
@@ -448,8 +635,8 @@ def get_options(album, track):
                         else:
                             opt_list = [{opt: options_dict[opt]}]
                         for opt_dict in opt_list:
-                            for opt in opt_dict:
-                                opt_value = opt_dict[opt]
+                            for opt_det in opt_dict:
+                                opt_value = opt_dict[opt_det]
                                 if section == 'artists':
                                     if options[override['tagmap']]:
                                         included_tag_options = plugin_options('tag')
@@ -458,13 +645,13 @@ def get_options(album, track):
                                     addn = included_tag_options + plugin_options('picard')
                                 else:
                                     if options[override['genres']]:
-                                        included_genre_options = plugin_options('genre')
+                                        included_genre_options = plugin_options('genres')
                                     else:
                                         included_genre_options = []
                                     addn = included_genre_options
                                 for ea_opt in plugin_options(section) + addn:
                                     displayed_option = options[ea_opt['option']]
-                                    if ea_opt['name'] == opt:
+                                    if ea_opt['name'] == opt_det:
                                         if 'value' in ea_opt:
                                             if ea_opt['value'] == opt_value:
                                                 options[ea_opt['option']] = True
@@ -475,13 +662,12 @@ def get_options(album, track):
                                         if options[ea_opt['option']
                                                    ] != displayed_option:
                                             if options['log_debug']:
-                                                log.debug(
-                                                    'Options overridden for option %s = %s', ea_opt['option'], opt_value)
+                                                write_log(release_id, 'debug', 'Options overridden for option %s = %s',
+                                                          ea_opt['option'], opt_value)
 
                                             opt_text = unicode(opt_value)
-                                            append_tag(
-                                                tm, '003_information:options_overridden', unicode(
-                                                    ea_opt['name']) + ' = ' + opt_text)
+                                            append_tag(release_id, tm, '003_information:options_overridden', unicode(
+                                                ea_opt['name']) + ' = ' + opt_text)
 
         if orig_metadata:
             keep_list = options['cea_keep'].split(",")
@@ -513,10 +699,8 @@ def get_options(album, track):
         tm['~ce_options'] = options_dict
         tm['~ce_file'] = music_file_found
         if options['log_info']:
-            log.info(
-                'Get_options is returning options shown below and file: %s',
-                music_file_found)
-            log.info(options_dict)
+            write_log(release_id, 'info', 'Get_options is returning options shown below for file: %s', music_file_found)
+            write_log(release_id, 'info', options_dict)
 
 
 def plugin_options(option_type):
@@ -997,7 +1181,7 @@ def plugin_options(option_type):
          'default': 'Medley of:'
          }
     ]
-    # OPtions on "Genres etc." tab
+    # Options on "Genres etc." tab
 
     genre_options = [
         {'option': 'cwp_genre_tag',
@@ -1173,8 +1357,8 @@ def plugin_options(option_type):
          'name': 'period map',
          'type': 'PlainText',
          'default': 'Early, -3000,800; Medieval, 800,1400; Renaissance, 1400, 1600; Baroque, 1600,1750; '
-                    'Classical, 1750,1820; Early Romantic, 1820,1850; Late Romantic, 1850,1910; 20th Century, 1910,1975'
-                    'Contemporary, 1975,2525'
+                    'Classical, 1750,1820; Early Romantic, 1800,1850; Late Romantic, 1850,1910; '
+                    '20th Century, 1910,1975; Contemporary, 1975,2525'
          }
     ]
     # Picard options which are also saved
@@ -1301,6 +1485,10 @@ def plugin_options(option_type):
          'type': 'Boolean',
          'default': False
          },
+        {'option': 'log_basic',
+         'type': 'Boolean',
+         'default': True
+         },
         {'option': 'log_info',
          'type': 'Boolean',
          'default': False
@@ -1372,8 +1560,10 @@ def option_settings(config_settings):
     return options
 
 
-def get_aliases(self, album, options, releaseXmlNode):
+def get_aliases(self, release_id, album, options, releaseXmlNode):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param self:
     :param album:
     :param options:
@@ -1401,75 +1591,48 @@ def get_aliases(self, album, options, releaseXmlNode):
         lang = locale.split("_")[0]  # NB this is the Picard code in /util
 
         # Release group artists
-        obj = parse_data(options, releaseXmlNode, [], 'release_group')
-        get_aliases_and_credits(
-            self,
-            options,
-            album,
-            obj,
-            lang,
-            options['cea_group_credited'])
+        obj = parse_data(release_id, releaseXmlNode, [], 'release_group')
+        get_aliases_and_credits(self, options, release_id, album, obj, lang, options['cea_group_credited'])
 
         # Release artists
-        get_aliases_and_credits(
-            self,
-            options,
-            album,
-            releaseXmlNode,
-            lang,
-            options['cea_credited'])
+        get_aliases_and_credits(self, options, release_id, album, releaseXmlNode, lang, options['cea_credited'])
         # Next bit needed to identify artists who are album artists
-        self.release_artists_sort[album] = parse_data(
-            options,
-            releaseXmlNode,
-            [],
-            'artist_credit',
-            'name_credit',
-            'artist',
-            'sort_name',
-            'text')
+        self.release_artists_sort[album] = parse_data(release_id, releaseXmlNode, [], 'artist_credit', 'name_credit',
+                                                      'artist', 'sort_name', 'text')
         # Release relationship artists (credits only)
         if options['cea_release_relationship_credited']:
-            get_relation_credits(self, options, album, releaseXmlNode)
+            get_relation_credits(self, options, release_id, album, releaseXmlNode)
 
         # Track and recording aliases/credits are gathered by parsing the
         # media, track and recording nodes
-        media = parse_data(
-            options,
-            releaseXmlNode,
-            [],
-            'medium_list',
-            'medium')
+        media = parse_data(release_id, releaseXmlNode, [], 'medium_list', 'medium')
         for m in media:
             # disc_num = int(parse_data(options, m, [], 'position', 'text')[0])
             # not currently used
-            tracks = parse_data(options, m, [], 'track_list', 'track')
+            tracks = parse_data(release_id, m, [], 'track_list', 'track')
             for tlist in tracks:
                 for t in tlist:
                     # track_num = int(parse_data(options, t, [], 'number',
                     # 'text')[0]) # not currently used
-                    obj = parse_data(options, t, [], 'recording')
-                    get_aliases_and_credits(
-                        self,
-                        options,
-                        album,
-                        obj,
-                        lang,
-                        options['cea_recording_credited'])  # recording artists
+                    obj = parse_data(release_id, t, [], 'recording')
+                    get_aliases_and_credits(self, options, release_id, album, obj, lang,
+                                            options['cea_recording_credited'])  # recording artists
                     if options['cea_recording_relationship_credited']:
                         # recording relationship artists (credits only)
-                        get_relation_credits(self, options, album, obj)
-                    get_aliases_and_credits(
-                        self, options, album, t, lang, options['cea_track_credited'])  # track artists
+                        get_relation_credits(self, options, release_id, album, obj)
+                    get_aliases_and_credits(self, options, release_id, album, t, lang,
+                                            options['cea_track_credited'])  # track artists
     if options['log_info']:
-        log.info('Alias and credits info for %s', self)
-        log.info('Aliases :%s', self.artist_aliases)
-        log.info('Credits :%s', self.artist_credits[album])
+        write_log(release_id, 'info', 'Alias and credits info for %s', self)
+        write_log(release_id, 'info', 'Aliases :%s', self.artist_aliases)
+        write_log(release_id, 'info', 'Credits :%s', self.artist_credits[album])
 
 
-def get_artists(options, tm, relations, relation_type):
+def get_artists(options, release_id, tm, relations, relation_type):
     """
     Get artist info from XML lookup
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param options:
     :param tm:
     :param relations:
@@ -1483,31 +1646,13 @@ def get_artists(options, tm, relations, relation_type):
     instruments = []
     artist_types = RELATION_TYPES[relation_type]
     for artist_type in artist_types:
-        type_list = parse_data(
-            log_options,
-            relations,
-            [],
-            'attribs.target_type:artist',
-            'relation',
-            'attribs.type:' +
-            artist_type)
+        type_list = parse_data(release_id, relations, [], 'attribs.target_type:artist', 'relation', 'attribs.type:' +
+                               artist_type)
         for type_item in type_list:
-            artist_name_list = parse_data(
-                log_options,
-                type_item,
-                [],
-                'direction.text:backward',
-                'artist',
-                'name',
-                'text')
-            artist_sort_name_list = parse_data(
-                log_options,
-                type_item,
-                [],
-                'direction.text:backward',
-                'artist',
-                'sort_name',
-                'text')
+            artist_name_list = parse_data(release_id, type_item, [], 'direction.text:backward', 'artist', 'name',
+                                          'text')
+            artist_sort_name_list = parse_data(release_id, type_item, [], 'direction.text:backward', 'artist',
+                                               'sort_name', 'text')
             if artist_type not in [
                 'instrument',
                 'vocal',
@@ -1518,19 +1663,12 @@ def get_artists(options, tm, relations, relation_type):
             else:
                 instrument_list = []
                 credited_inst_list = []
-                att_list = parse_data(
-                    log_options,
-                    type_item,
-                    [],
-                    'direction.text:backward',
-                    'attribute_list',
-                    'attribute')
+                att_list = parse_data(release_id, type_item, [], 'direction.text:backward', 'attribute_list',
+                                      'attribute')
                 for inst_nodes in att_list:
                     for inst_node in inst_nodes:
-                        cred_list = parse_data(
-                            log_options, inst_node, [], 'attribs.credited_as')
-                        inst_list = parse_data(
-                            log_options, inst_node, [], 'text')
+                        cred_list = parse_data(release_id, inst_node, [], 'attribs.credited_as')
+                        inst_list = parse_data(release_id, inst_node, [], 'text')
                         if cred_list:
                             credited_inst_list += cred_list
                         else:
@@ -1549,7 +1687,7 @@ def get_artists(options, tm, relations, relation_type):
                 cred_tag = []
                 if instrument_list:
                     if options['log_info']:
-                        log.info('instrument_list: %s', instrument_list)
+                        write_log(release_id, 'info', 'instrument_list: %s', instrument_list)
                     inst_tag = list(set(instrument_list))
                 if credited_inst_list:
                     cred_tag = list(set(credited_inst_list))
@@ -1621,9 +1759,7 @@ def get_artists(options, tm, relations, relation_type):
             else:
                 type_sort = 99
                 if log_options['log_error']:
-                    log.error(
-                        "Error in artist type. Type '%s' is not in dictionary",
-                        artist_type)
+                    write_log(release_id, 'error', "Error in artist type. Type '%s' is not in dictionary", artist_type)
 
             artist = (
                 artist_type,
@@ -1636,44 +1772,24 @@ def get_artists(options, tm, relations, relation_type):
             # Sorted by sort name then instrument_sort then artist type
             artists = sorted(artists, key=lambda x: (x[5], x[3], x[4], x[1]))
             if log_options['log_info']:
-                log.info('sorted artists = %s', artists)
+                write_log(release_id, 'info', 'sorted artists = %s', artists)
     artist_dict = {'artists': artists, 'instruments': instruments}
     return artist_dict
 
 
-def apply_artist_style(
-        options,
-        lang,
-        a_list,
-        name_style,
-        name_tag,
-        sort_tag,
-        names_tag,
-        names_sort_tag):
+def apply_artist_style(options, release_id, lang, a_list, name_style, name_tag, sort_tag, names_tag, names_sort_tag):
     # Get  artist and apply style
     for acs in a_list:
         for ncs in acs:
-            artistlist = parse_data(
-                options, ncs, [], 'artist', 'name', 'text')
-            sortlist = parse_data(
-                options, ncs, [], 'artist', 'sort_name', 'text')
+            artistlist = parse_data(release_id, ncs, [], 'artist', 'name', 'text')
+            sortlist = parse_data(release_id, ncs, [], 'artist', 'sort_name', 'text')
             names = {}
             if lang:
-                names['alias'] = parse_data(
-                    options,
-                    ncs,
-                    [],
-                    'artist',
-                    'alias_list',
-                    'alias',
-                    'attribs.locale:' +
-                    lang,
-                    'attribs.primary:primary',
-                    'text')
+                names['alias'] = parse_data(release_id, ncs, [], 'artist', 'alias_list', 'alias', 'attribs.locale:' +
+                                            lang, 'attribs.primary:primary', 'text')
             else:
                 names['alias'] = []
-            names['credit'] = parse_data(
-                options, ncs, [], 'name', 'text')
+            names['credit'] = parse_data(release_id, ncs, [], 'name', 'text')
             pairslist = zip(artistlist, sortlist)
             names['sort'] = [
                 translate_from_sortname(
@@ -1682,8 +1798,7 @@ def apply_artist_style(
                 if names[style]:
                     artistlist = names[style]
                     break
-            joinlist = parse_data(
-                options, ncs, [], 'attribs.joinphrase')
+            joinlist = parse_data(release_id, ncs, [], 'attribs.joinphrase')
 
             if artistlist:
                 name_tag.append(artistlist[0])
@@ -1705,8 +1820,9 @@ def apply_artist_style(
         'artistsort': sort_tag_str}
 
 
-def set_work_artists(self, album, track, writerList, tm, count):
+def set_work_artists(self, release_id, album, track, writerList, tm, count):
     """
+    :param release_id:
     :param self is the calling object from Artists or WorkParts
     :param album: the current album
     :param track: the current track
@@ -1723,14 +1839,10 @@ def set_work_artists(self, album, track, writerList, tm, count):
     else:
         caller = 'PartLevels'
         pre = '~cwp'
-    if self.DEBUG:
-        log.debug(
-            '%s, Class: %s: in set_work_artists for track %s. Count (level) is %s. Writer list is %s',
-            PLUGIN_NAME,
-            caller,
-            track,
-            count,
-            writerList)
+    if self.DEBUG or self.INFO:
+        write_log(release_id, 'debug',
+                  'Class: %s: in set_work_artists for track %s. Count (level) is %s. Writer list is %s',
+                  caller, track, count, writerList)
     # tag strings are a tuple (Picard tag, cwp tag, Picard sort tag, cwp sort
     # tag) (NB this is modelled on set_performer)
     tag_strings = {
@@ -1852,7 +1964,7 @@ def set_work_artists(self, album, track, writerList, tm, count):
                     tag not in tm or not tm['~ce_tag_cleared_' + tag] == "Y":
                 if tag in tm:
                     if options['log_info']:
-                        log.info('delete tag %s', tag)
+                        write_log(release_id, 'info', 'delete tag %s', tag)
                     del tm[tag]
             tm['~ce_tag_cleared_' + tag] = "Y"
         if sort_tag:
@@ -1867,7 +1979,7 @@ def set_work_artists(self, album, track, writerList, tm, count):
             sort_name = writer[3][ind]
             no_credit = True
             if self.INFO:
-                log.info('In set_work_artists. Name before changes = %s', name)
+                write_log(release_id, 'info', 'In set_work_artists. Name before changes = %s', name)
             # change name to as-credited
             if options['cea_composer_credited']:
                 if sort_name in self.artist_credits[album]:
@@ -1886,7 +1998,7 @@ def set_work_artists(self, album, track, writerList, tm, count):
                     # performer is in non-latin script
             annotated_name = name
             if self.INFO:
-                log.info('In set_work_artists. Name after changes = %s', name)
+                write_log(release_id, 'info', 'In set_work_artists. Name after changes = %s', name)
             # add annotations and write performer tags
             if writer_type in annotations:
                 if annotations[writer_type]:
@@ -1897,43 +2009,39 @@ def set_work_artists(self, album, track, writerList, tm, count):
                 instrumented_name = name
 
             if writer_type in insertions and options['cea_arrangers']:
-                self.append_tag(tm, tag, annotated_name)
+                self.append_tag(release_id, tm, tag, annotated_name)
             else:
                 if options['cea_arrangers'] or writer_type == tag:
-                    self.append_tag(tm, tag, name)
+                    self.append_tag(release_id, tm, tag, name)
 
             if options['cea_arrangers'] or writer_type == tag:
                 if sort_tag:
-                    self.append_tag(tm, sort_tag, sort_name)
+                    self.append_tag(release_id, tm, sort_tag, sort_name)
                     if options['cea_tag_sort'] and '~' in sort_tag:
                         explicit_sort_tag = sort_tag.replace('~', '')
-                        self.append_tag(tm, explicit_sort_tag, sort_name)
+                        self.append_tag(release_id, tm, explicit_sort_tag, sort_name)
 
-            self.append_tag(tm, cwp_tag, annotated_name)
-            self.append_tag(tm, cwp_names_tag, name)
+            self.append_tag(release_id, tm, cwp_tag, annotated_name)
+            self.append_tag(release_id, tm, cwp_names_tag, name)
             if instrumented_name != name:
-                self.append_tag(tm, cwp_instrumented_tag, instrumented_name)
+                self.append_tag(release_id, tm, cwp_instrumented_tag, instrumented_name)
 
             if cwp_sort_tag:
-                self.append_tag(tm, cwp_sort_tag, sort_name)
+                self.append_tag(release_id, tm, cwp_sort_tag, sort_name)
 
             if caller == 'PartLevels' and (
                     writer_type == 'lyricist' or writer_type == 'librettist'):
                 self.lyricist_filled[track] = True
-                if self.DEBUG:
-                    log.debug(
-                        '%s: Filled lyricist for track %s. Not looking further',
-                        PLUGIN_NAME,
-                        track)
+                write_log(release_id, 'info', 'Filled lyricist for track %s. Not looking further',
+                              track)
 
             if writer_type == 'composer':
                 if sort_name in self.release_artists_sort[album]:
                     composerlast = sort_name.split(",")[0]
-                    self.append_tag(tm, '~cea_album_composers', name)
-                    self.append_tag(tm, '~cea_album_composers_sort', sort_name)
-                    self.append_tag(
-                        tm, '~cea_album_track_composer_lastnames', composerlast)
-                    composer_last_names(self, tm, album)
+                    self.append_tag(release_id, tm, '~cea_album_composers', name)
+                    self.append_tag(release_id, tm, '~cea_album_composers_sort', sort_name)
+                    self.append_tag(release_id, tm, '~cea_album_track_composer_lastnames', composerlast)
+                    composer_last_names(self, release_id, tm, album)
 
 
 # Non-Latin character processing
@@ -2169,8 +2277,56 @@ def from_roman(s):
     return result
 
 
+def turbo_lcs(release_id, multi_list):
+    """
+    Picks the best longest common string method to use
+    Works with lists or strings
+    :param release_id: 
+    :param multi_list: a list of strings or a list of lists
+    :return: longest common substring/list
+    """
+    write_log(release_id, 'debug', 'In turbo_lcs')
+    if not isinstance(multi_list, list):
+        return None
+    list_sum = sum([len(x) for x in multi_list])
+    list_len = len(multi_list)
+    if list_len < 2:
+        write_log(release_id, 'debug', 'Only one item in list - no algo required')
+        return multi_list[0]  # Nothing to do!
+    # for big matches, use the generalised suffix tree method
+    if ((list_sum / list_len) ** 2) * list_len > 1000:
+        # heuristic: may need to tweak the 1000 in the light of results
+        lcs_list = suffixtree.multi_lcs(multi_list)
+        if "error" not in lcs_list:
+            if "response" in lcs_list:
+                    write_log(release_id, 'debug', 'LCS returned from suffix tree algo')
+                    return lcs_list['response']
+            else:
+                write_log(release_id, 'error',
+                          'Suffix tree failure for release %s. Error unknown. Using standard lcs algo instead',
+                          release_id)
+        else:
+            write_log(release_id, 'debug',
+                      'Suffix tree failure for release %s. Error message: %s. Using standard lcs algo instead',
+                      release_id, lcs_list['error'])
+    # otherwise, or if gst fails, use the standard algorithm
+    first = True
+    common = []
+    for item in multi_list:
+        if first:
+            common = item
+            first = False
+        else:
+            lcs = longest_common_substring(
+                item, common)
+            common = lcs['string']
+    write_log(release_id, 'debug', 'LCS returned from standard algo')
+    return common
+
+
 def longest_common_substring(s1, s2):
     """
+    Standard lcs algo for short strings, or if suffix tree does not work
     :param s1: substring 1
     :param s2: substring 2
     :return: {'string': the longest common substring,
@@ -2218,8 +2374,17 @@ def longest_common_sequence(list1, list2, minstart=0, maxstart=0):
     return {'sequence': seq, 'length': longest}
 
 
-def map_tags(options, album, tm):
+def substart_finder(mylist, pattern):
+    for i in range(len(mylist)):
+        if mylist[i] == pattern[0] and mylist[i:i+len(pattern)] == pattern:
+            return i
+    return len(mylist)  # if nothing found
+
+
+def map_tags(options, release_id, album, tm):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param options: options passed from either Artists or Workparts
     :param album:
     :param tm: track metadata
@@ -2232,19 +2397,19 @@ def map_tags(options, album, tm):
     WARNING = options["log_warning"]
     DEBUG = options["log_debug"]
     INFO = options["log_info"]
-    if DEBUG:
-        log.debug('In map_tags, checking readiness...')
+    if DEBUG or INFO:
+        write_log(release_id, 'debug', 'In map_tags, checking readiness...')
     if (options['classical_extra_artists'] and '~cea_artists_complete' not in tm) or (
             options['classical_work_parts'] and '~cea_works_complete' not in tm):
         if INFO:
-            log.info('...not ready')
+            write_log(release_id, 'info', '...not ready')
         return
-    if DEBUG:
-        log.debug('... processing tag mapping')
+    if DEBUG or INFO:
+        write_log(release_id, 'debug', '... processing tag mapping')
     if INFO:
         for ind, opt in enumerate(options):
-            log.info('Option %s of %s. Option= %s, Value= %s',
-                     ind + 1, len(options), opt, options[opt])
+            write_log(release_id, 'info', 'Option %s of %s. Option= %s, Value= %s', ind + 1, len(options), opt,
+                      options[opt])
     # album
     if tm['~cea_album_composer_lastnames']:
         if isinstance(tm['~cea_album_composer_lastnames'], list):
@@ -2272,7 +2437,7 @@ def map_tags(options, album, tm):
     # genres
     if config.setting['folksonomy_tags'] and 'genre' in tm:
         candidate_genres = str_to_list(tm['genre'])
-        append_tag(tm, '~cea_candidate_genres', candidate_genres)
+        append_tag(release_id, tm, '~cea_candidate_genres', candidate_genres)
         del tm['genre']  # to avoid confusion as it will contain unmatched folksonomy tags
     else:
         candidate_genres = []
@@ -2304,10 +2469,11 @@ def map_tags(options, album, tm):
                     composer_index = lc_composer_list.index(composer)
                     orig_composer = composer_list[composer_index]
                     composers_not_found.append(orig_composer)
-                    append_tag(tm, '~cwp_unrostered_composers', orig_composer)
+                    append_tag(release_id, tm, '~cwp_unrostered_composers', orig_composer)
             if composers_not_found:
-                append_tag(tm, '003_information:composers', 'Composer(s) '
-                           + list_to_str(composers_not_found) + ' not found in reference database of classical composers')
+                append_tag(release_id, tm, '003_information:composers', 'Composer(s) '
+                           + list_to_str(
+                    composers_not_found) + ' not found in reference database of classical composers')
 
             # do the same for arrangers, if required
             if options['cwp_genres_arranger_as_composer'] or options['cwp_periods_arranger_as_composer']:
@@ -2328,14 +2494,16 @@ def map_tags(options, album, tm):
                         arranger_index = lc_arranger_list.index(arranger)
                         orig_arranger = arranger_list[arranger_index]
                         arrangers_not_found.append(orig_arranger)
-                        append_tag(tm, '~cwp_unrostered_arrangers', orig_arranger)
+                        append_tag(release_id, tm, '~cwp_unrostered_arrangers', orig_arranger)
                 if arrangers_not_found:
-                    append_tag(tm, '003_information:arrangers', 'Arranger(s) '
-                               + list_to_str(
-                        arrangers_not_found) + ' not found in reference database of classical composers')
+                    append_tag(release_id, tm, '003_information:arrangers',
+                               'Arranger(s) ' + list_to_str(arrangers_not_found) +
+                               ' not found in reference database of classical composers')
 
         else:
-            append_tag(tm, '001_errors:8', '8. No composer reference file. Check log for error messages re path name.')
+            append_tag(release_id, tm, '001_errors:8',
+                       '8. No composer reference file. Check log for error messages re path name.')
+
     if options['cwp_use_muso_refdb'] and options['cwp_muso_genres'] and GENRE_DICT:
         main_classical_genres_list = [list_to_str(mg['name']).strip() for mg in GENRE_DICT]
     else:
@@ -2352,7 +2520,7 @@ def map_tags(options, album, tm):
     if '~cwp_candidate_genres' in tm:
         candidate_genres += str_to_list(tm['~cwp_candidate_genres'])
     if INFO:
-        log.info("Candidate genres: ", candidate_genres)
+        write_log(release_id, 'info', "Candidate genres: %r", candidate_genres)
     untagged_genres = []
     if candidate_genres:
         main_classical_genres = [val for val in main_classical_genres_list
@@ -2382,21 +2550,21 @@ def map_tags(options, album, tm):
 
 
     if options['cwp_genre_tag']:
-        append_tag(tm, options['cwp_genre_tag'], main_classical_genres + main_other_genres)
+        append_tag(release_id, tm, options['cwp_genre_tag'], main_classical_genres + main_other_genres)
     if options['cwp_subgenre_tag']:
-        append_tag(tm, options['cwp_subgenre_tag'], sub_classical_genres + sub_other_genres)
+        append_tag(release_id, tm, options['cwp_subgenre_tag'], sub_classical_genres + sub_other_genres)
     if is_classical and options['cwp_genres_flag_text'] and options['cwp_genres_flag_tag']:
         tm[options['cwp_genres_flag_tag']] = options['cwp_genres_flag_text']
     if not (main_classical_genres + main_other_genres):
         if options['cwp_genres_default']:
-            append_tag(tm, options['cwp_genre_tag'], options['cwp_genres_default'])
+            append_tag(release_id, tm, options['cwp_genre_tag'], options['cwp_genres_default'])
         else:
             if options['cwp_genre_tag'] in tm:
                 del tm[options['cwp_genre_tag']]
     if untagged_genres:
-        append_tag(tm, '003_information:genres',
+        append_tag(release_id, tm, '003_information:genres',
                    'Candidate genres found but not matched: ' + list_to_str(untagged_genres))
-        append_tag(tm, '~cwp_untagged_genres', untagged_genres)
+        append_tag(release_id, tm, '~cwp_untagged_genres', untagged_genres)
 
     # instruments and keys
     if options['cwp_instruments_MB_names'] and options['cwp_instruments_credited_names'] and tm['~cea_instruments_all']:
@@ -2408,10 +2576,10 @@ def map_tags(options, album, tm):
     else:
         instruments = None
     if instruments and options['cwp_instruments_tag']:
-        append_tag(tm, options['cwp_instruments_tag'], instruments)
+        append_tag(release_id, tm, options['cwp_instruments_tag'], instruments)
         # need to append rather than over-write as it may be the same as another tag (e.g. genre)
     if tm['~cwp_keys'] and options['cwp_key_tag']:
-        append_tag(tm, options['cwp_key_tag'], tm['~cwp_keys'])
+        append_tag(release_id, tm, options['cwp_key_tag'], tm['~cwp_keys'])
 
     # dates
     if options['cwp_workdate_annotate']:
@@ -2431,7 +2599,7 @@ def map_tags(options, album, tm):
         if len(composed_dates_list) > 1:
             composed_dates_list = str_to_list(composed_dates_list[0])  # use dates of lowest-level work
         earliest_date = min([int(dates.split(DATE_SEP)[0].strip()) for dates in composed_dates_list])
-        append_tag(tm, options['cwp_workdate_tag'], list_to_str(composed_dates_list) + comp)
+        append_tag(release_id, tm, options['cwp_workdate_tag'], list_to_str(composed_dates_list) + comp)
         found = True
     if tm['~cwp_published_dates'] and (not found or options['cwp_workdate_use_all']):
         if not found:
@@ -2439,7 +2607,7 @@ def map_tags(options, album, tm):
             if len(published_dates_list) > 1:
                 published_dates_list = str_to_list(published_dates_list[0])  # use dates of lowest-level work
             earliest_date = min([int(dates.split(DATE_SEP)[0].strip()) for dates in published_dates_list])
-            append_tag(tm, options['cwp_workdate_tag'], list_to_str(published_dates_list) + publ)
+            append_tag(release_id, tm, options['cwp_workdate_tag'], list_to_str(published_dates_list) + publ)
             found = True
     if tm['~cwp_premiered_dates'] and (not found or options['cwp_workdate_use_all']):
         if not found:
@@ -2447,7 +2615,7 @@ def map_tags(options, album, tm):
             if len(premiered_dates_list) > 1:
                 premiered_dates_list = str_to_list(premiered_dates_list[0])  # use dates of lowest-level work
             earliest_date = min([int(dates.split(DATE_SEP)[0].strip()) for dates in premiered_dates_list])
-            append_tag(tm, options['cwp_workdate_tag'], list_to_str(premiered_dates_list) + prem)
+            append_tag(release_id, tm, options['cwp_workdate_tag'], list_to_str(premiered_dates_list) + prem)
 
     # periods
     PERIODS = {}
@@ -2500,20 +2668,14 @@ def map_tags(options, album, tm):
         for period in PERIODS:
             if 'ERROR' in PERIODS[period]:
                 tm[options['cwp_period_tag']] = ''
-                append_tag(
-                    tm,
-                    '001_errors:9',
-                    '9. ' + PERIODS[period])
+                append_tag(release_id, tm, '001_errors:9', '9. ' + PERIODS[period])
                 break
             if earliest_date < 9999:
                 if PERIODS[period][0] <= earliest_date <= PERIODS[period][1]:
-                    append_tag(tm, options['cwp_period_tag'], period)
+                    append_tag(release_id, tm, options['cwp_period_tag'], period)
             if latest_date > -9999:
                 if PERIODS[period][0] <= latest_date <= PERIODS[period][1]:
-                    append_tag(tm, options['cwp_period_tag'], period)
-
-
-
+                    append_tag(release_id, tm, options['cwp_period_tag'], period)
 
     # generic tag mapping
     sort_tags = options['cea_tag_sort']
@@ -2536,7 +2698,7 @@ def map_tags(options, album, tm):
                             source_item = source_itemx.strip()
                             source_itema = source_itemx.lstrip()
                             if INFO:
-                                log.info("Source_item: %s", source_item)
+                                write_log(release_id, 'info', "Source_item: %s", source_item)
                             if "~cea_" + source_item in tm:
                                 si = tm['~cea_' + source_item]
                             elif "~cwp_" + source_item in tm:
@@ -2555,57 +2717,47 @@ def map_tags(options, album, tm):
                         source = sourceline[0]
                     no_names_source = re.sub('(_names)$', 's', source)
                     source_sort = sort_suffix(source)
-                    if DEBUG:
-                        log.debug(
-                            "%s: Tag mapping: Line: %s, Source: %s, Tag: %s, no_names_source: %s, sort: %s, item %s",
-                            PLUGIN_NAME,
-                            i +
-                            1,
-                            source,
-                            tag,
-                            no_names_source,
-                            sort,
-                            item)
+                    if INFO:
+                        write_log(release_id, 'info',
+                                  "Tag mapping: Line: %s, Source: %s, Tag: %s, no_names_source: %s, sort: %s, item %s",
+                                  i + 1, source, tag, no_names_source, sort, item)
                     if '~cea_' + source in tm or '~cwp_' + source in tm:
                         for prefix in ['~cea_', '~cwp_']:
                             if prefix + source in tm:
                                 if INFO:
-                                    log.info(prefix)
-                                append_tag(
-                                    tm, tag, tm[prefix + source], ['; '])
+                                    write_log(release_id, 'info', prefix)
+                                append_tag(release_id, tm, tag, tm[prefix + source], ['; '])
                                 if sort_tags:
                                     if prefix + no_names_source + source_sort in tm:
                                         if INFO:
-                                            log.info(prefix + " sort")
-                                        append_tag(
-                                            tm, tag + sort, tm[prefix + no_names_source + source_sort], ['; '])
+                                            write_log(release_id, 'info', prefix + " sort")
+                                        append_tag(release_id, tm, tag + sort,
+                                                   tm[prefix + no_names_source + source_sort], ['; '])
                     elif source in tm or '~' + source in tm:
                         if INFO:
-                            log.info("Picard")
+                            write_log(release_id, 'info', "Picard")
                         for p in ['', '~']:
                             if p + source in tm:
-                                append_tag(
-                                    tm, tag, tm[p + source], ['; ', '/ '])
+                                append_tag(release_id, tm, tag, tm[p + source], ['; ', '/ '])
                         if sort_tags:
                             if "~" + source + source_sort in tm:
                                 source = "~" + source
                             if source + source_sort in tm:
                                 if INFO:
-                                    log.info("Picard sort")
-                                append_tag(tm, tag + sort,
-                                           tm[source + source_sort], ['; ', '/ '])
+                                    write_log(release_id, 'info', "Picard sort")
+                                append_tag(release_id, tm, tag + sort, tm[source + source_sort], ['; ', '/ '])
                     elif len(source) > 0 and source[0] == "\\":
-                        append_tag(tm, tag, source[1:], ['; ', '/ '])
+                        append_tag(release_id, tm, tag, source[1:], ['; ', '/ '])
                     else:
                         pass
     if ERROR and "~cea_error" in tm:
         for error in str_to_list(tm['~cea_error']):
             ecode = error[0]
-            append_tag(tm, '001_errors:' + ecode, error)
+            append_tag(release_id, tm, '001_errors:' + ecode, error)
     if WARNING and "~cea_warning" in tm:
         for warning in str_to_list(tm['~cea_warning']):
             wcode = warning[0]
-        append_tag(tm, '002_warnings:' + wcode , warning)
+        append_tag(release_id, tm, '002_warnings:' + wcode, warning)
     if not DEBUG:
         if '~cea_works_complete' in tm:
             del tm['~cea_works_complete']
@@ -2636,8 +2788,8 @@ def map_tags(options, album, tm):
                         del orig_metadata[delete_item]
                         warn.append(delete_item)
             if warn and WARNING:
-                append_tag(tm, '002_warnings:7', '7. Deleted tags: ' + ', '.join(warn))
-                log.warning('Deleted tags: ' + ', '.join(warn))
+                append_tag(release_id, tm, '002_warnings:7', '7. Deleted tags: ' + ', '.join(warn))
+                write_log(release_id, 'warning', 'Deleted tags: ' + ', '.join(warn))
 
 def sort_suffix(tag):
     """To determine what sort suffix is appropriate for a given tag"""
@@ -2648,8 +2800,10 @@ def sort_suffix(tag):
     return sort
 
 
-def append_tag(tm, tag, source, separators=None):
+def append_tag(release_id, tm, tag, source, separators=None):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param tm: track metadata
     :param tag: tag to be appended to
     :param source: item to append to tag
@@ -2660,14 +2814,10 @@ def append_tag(tm, tag, source, separators=None):
     if not separators:
         separators = []
     if tag:
-        if config.setting['log_debug']:
-            log.debug(
-                '%s: appending source: %r to tag: %s (source is type %s) ...',
-                PLUGIN_NAME,
-                source,
-                tag,
-                type(source))
-            log.debug('... existing tag contents = %r', tm[tag])
+        if config.setting['log_info']:
+            write_log(release_id, 'info', 'Appending source: %r to tag: %s (source is type %s) ...',
+                      source, tag, type(source))
+            write_log(release_id, 'info', '... existing tag contents = %r', tm[tag])
         if source and len(source) > 0:
             if isinstance(source, basestring):
                 source = source.replace(u'\u2010', u'-')
@@ -2726,32 +2876,32 @@ def append_tag(tm, tag, source, separators=None):
 
 
 
-def get_artist_credit(options, obj):
+def get_artist_credit(options, release_id, obj):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param options:
     :param obj: an XmlNode
     :return: a list of as-credited names
     """
-    name_credit_list = parse_data(
-        options, obj, [], 'artist_credit', 'name_credit')
+    name_credit_list = parse_data(release_id, obj, [], 'artist_credit', 'name_credit')
     credit_list = []
     if name_credit_list:
         for name_credits in name_credit_list:
             for name_credit in name_credits:
-                credited_artist = parse_data(
-                    options, name_credit, [], 'name', 'text')
+                credited_artist = parse_data(release_id, name_credit, [], 'name', 'text')
                 if credited_artist:
-                    name = parse_data(
-                        options, name_credit, [], 'artist', 'name', 'text')
-                    sort_name = parse_data(
-                        options, name_credit, [], 'artist', 'sort_name', 'text')
+                    name = parse_data(release_id, name_credit, [], 'artist', 'name', 'text')
+                    sort_name = parse_data(release_id, name_credit, [], 'artist', 'sort_name', 'text')
                     credit_item = (credited_artist, name, sort_name)
                     credit_list.append(credit_item)
         return credit_list
 
 
-def get_aliases_and_credits(self, options, album, obj, lang, credited):
+def get_aliases_and_credits(self, options, release_id, album, obj, lang, credited):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param album:
     :param self: This relates to the object in the class which called this function
     :param options:
@@ -2760,39 +2910,30 @@ def get_aliases_and_credits(self, options, album, obj, lang, credited):
     :param credited: The options item to determine what as-credited names are being sought
     :return: None. Sets self.artist_aliases and self.artist_credits[album]
     """
-    name_credit_list = parse_data(
-        options, obj, [], 'artist_credit', 'name_credit')
-    artist_list = parse_data(options, name_credit_list, [], 'artist')
+    name_credit_list = parse_data(release_id, obj, [], 'artist_credit', 'name_credit')
+    artist_list = parse_data(release_id, name_credit_list, [], 'artist')
     for artist in artist_list:
-        sort_names = parse_data(options, artist, [], 'sort_name', 'text')
+        sort_names = parse_data(release_id, artist, [], 'sort_name', 'text')
         if sort_names:
-            aliases = parse_data(
-                options,
-                artist,
-                [],
-                'alias_list',
-                'alias',
-                'attribs.locale:' +
-                lang,
-                'attribs.primary:primary',
-                'text')
+            aliases = parse_data(release_id, artist, [], 'alias_list', 'alias', 'attribs.locale:' +
+                                 lang, 'attribs.primary:primary', 'text')
             if aliases:
                 self.artist_aliases[sort_names[0]] = aliases[0]
     if credited:
         for name_credits in name_credit_list:
             for name_credit in name_credits:
-                credited_artists = parse_data(
-                    options, name_credit, [], 'name', 'text')
+                credited_artists = parse_data(release_id, name_credit, [], 'name', 'text')
                 if credited_artists:
-                    sort_names = parse_data(
-                        options, name_credit, [], 'artist', 'sort_name', 'text')
+                    sort_names = parse_data(release_id, name_credit, [], 'artist', 'sort_name', 'text')
                     if sort_names:
                         self.artist_credits[album][sort_names[0]
                                                    ] = credited_artists[0]
 
 
-def get_relation_credits(self, options, album, obj):
+def get_relation_credits(self, options, release_id, album, obj):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param self:
     :param options: UI options
     :param album: current album
@@ -2800,49 +2941,31 @@ def get_relation_credits(self, options, album, obj):
     :return: None
     Note that direct recording relationships will over-ride indirect ones (via work)
     """
-    rels = parse_data(
-        options,
-        obj,
-        [],
-        'relation_list',
-        'attribs.target_type:work',
-        'relation',
-        'attribs.type:performance',
-        'work',
-        'relation_list',
-        'attribs.target_type:artist',
-        'relation')
+    rels = parse_data(release_id, obj, [], 'relation_list', 'attribs.target_type:work', 'relation',
+                      'attribs.type:performance', 'work', 'relation_list', 'attribs.target_type:artist', 'relation')
     for rel in rels:
         for artist in rel:
-            sort_names = parse_data(
-                options, artist, [], 'artist', 'sort_name', 'text')
+            sort_names = parse_data(release_id, artist, [], 'artist', 'sort_name', 'text')
             if sort_names:
-                credited_artists = parse_data(
-                    options, artist, [], 'target_credit', 'text')
+                credited_artists = parse_data(release_id, artist, [], 'target_credit', 'text')
                 if credited_artists:
                     self.artist_credits[album][sort_names[0]
                                                ] = credited_artists[0]
-    rels2 = parse_data(
-        options,
-        obj,
-        [],
-        'relation_list',
-        'attribs.target_type:artist',
-        'relation')
+    rels2 = parse_data(release_id, obj, [], 'relation_list', 'attribs.target_type:artist', 'relation')
     for rel in rels2:
         for artist in rel:
-            sort_names = parse_data(
-                options, artist, [], 'artist', 'sort_name', 'text')
+            sort_names = parse_data(release_id, artist, [], 'artist', 'sort_name', 'text')
             if sort_names:
-                credited_artists = parse_data(
-                    options, artist, [], 'target_credit', 'text')
+                credited_artists = parse_data(release_id, artist, [], 'target_credit', 'text')
                 if credited_artists:
                     self.artist_credits[album][sort_names[0]
                                                ] = credited_artists[0]
 
 
-def composer_last_names(self, tm, album):
+def composer_last_names(self, release_id, tm, album):
     """
+    :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
     :param self:
     :param tm:
     :param album:
@@ -2877,25 +3000,21 @@ def composer_last_names(self, tm, album):
                 self.album_artists[album]['composer_lastnames'][composer_lastnames] = {
                     'length': track_length}
     else:
-        if self.WARNING:
-            log.warning(
-                "%s: No _cea_album_track_composer_lastnames variable available for recording \"%s\".",
-                PLUGIN_NAME,
-                tm['title'])
+        if self.WARNING or self.INFO:
+            write_log(release_id, 'warning',
+                      "No _cea_album_track_composer_lastnames variable available for recording \"%s\".", tm['title'])
         if 'composer' in tm:
-            self.append_tag(
-                tm,
-                '~cea_warning',
-                '1. Composer for this track is not in album artists and will not be available to prefix album')
+            self.append_tag(release_id, release_id, tm, '~cea_warning',
+                            '1. Composer for this track is not in album artists and will not be available to prefix album')
         else:
-            self.append_tag(
-                tm,
-                '~cea_warning',
-                '1. No composer for this track, but checking parent work.')
+            self.append_tag(release_id, release_id, tm, '~cea_warning',
+                            '1. No composer for this track, but checking parent work.')
 
 
 def add_list_uniquely(list_to, list_from):
     """
+    Adds any items in list_from to list_to, if they are not already present
+    If either arg is a string, it will be converted to a list, e.g. 'abc' -> ['abc']
     :param list_to:
     :param list_from:
     :return: appends only unique elements of list 2 to list 1
@@ -3005,7 +3124,6 @@ def year(date):
         date_list = date.split('-')
         return date_list[0]
 
-
 #################
 #################
 # EXTRA ARTISTS #
@@ -3020,7 +3138,9 @@ class ExtraArtists():
         self.album_artists = collections.defaultdict(
             lambda: collections.defaultdict(dict))
         # collection of artists to be applied at album level
-        self.track_listing = []
+        self.track_listing = collections.defaultdict(list)
+        # collection of tracks - format is {album: [track 1,
+        # track 2, ...]}
         self.options = collections.defaultdict(dict)
         # collection of Classical Extras options
         self.globals = collections.defaultdict(dict)
@@ -3060,26 +3180,31 @@ class ExtraArtists():
         :param releaseXmlNode: Everything in the release node downwards (so includes all track nodes)
         :return:
         """
-        # log.info('trackXmlNode = %s', trackXmlNode) # NB can crash Picard
-        # log.info('releaseXmlNode = %s', releaseXmlNode) # NB can crash Picard
-
+        release_id = track_metadata['musicbrainz_albumid']
+        if 'start' not in release_status[release_id]:
+            release_status[release_id]['start'] = datetime.now()
+        if 'lookups' not in release_status[release_id]:
+            release_status[release_id]['lookups'] = 0
+        release_status[release_id]['name'] = track_metadata['album']
+        release_status[release_id]['artists'] = True
+        write_log(release_id, 'debug', 'STARTING ARTIST PROCESSING FOR ALBUM %s, TRACK %s',
+                  track_metadata['album'], track_metadata['tracknumber'] + ' ' + track_metadata['title'])
+        # write_log('info', 'trackXmlNode = %s', trackXmlNode) # NB can crash Picard
+        # write_log('info', 'releaseXmlNode = %s', releaseXmlNode) # NB can crash Picard
         # Jump through hoops to get track object!!
         track = album._new_tracks[-1]
         tm = track.metadata
 
         # OPTIONS - OVER-RIDE IF REQUIRED
         if '~ce_options' not in tm:
-            # log.error('Artists gets track first...')
-            get_options(album, track)
+            write_log(release_id, 'debug', 'Artists gets track first...')
+            get_options(release_id, album, track)
         options = interpret(tm['~ce_options'])
         if not options:
             if config.setting["log_error"]:
-                log.error(
-                    '%s: Artists. Failure to read options for track %s. options = %s',
-                    PLUGIN_NAME,
-                    track,
-                    tm['~ce_options'])
-            options = config.setting
+                write_log(release_id, 'error', 'Artists. Failure to read saved options for track %s. options = %s',
+                          track, tm['~ce_options'])
+            options = option_settings(config.setting)
         self.options[track] = options
 
         # CONSTANTS
@@ -3099,22 +3224,22 @@ class ExtraArtists():
         # NOT USED
         album_files = album.tagger.get_files_from_objects([album])
         if options['log_info']:
-            log.info('ALBUM FILENAMES for album %r = %s', album, album_files)
+            write_log(release_id, 'info', 'ALBUM FILENAMES for album %r = %s', album, album_files)
         track_files = track.iterfiles(Track(track, album))
         # tf = uniqify(chain(*[track.iterfiles(Track(t, album))for t in [track]]))
         # tf = Tagger.get_files_from_objects(Track(track, album), [track])
         # tf = uniqify(chain(*[t.iterfiles(album) for t in [track]]))
         # tf = track.tagger.get_files_from_objects([track])
-        # log.error('TRACK FILENAMES for track %r = %s', track, track_files)
-        # log.error('TRACK FILENAMES 2 for track %r = %s', track, tf)
+        # write_log('error', 'TRACK FILENAMES for track %r = %s', track, track_files)
+        # write_log('error', 'TRACK FILENAMES 2 for track %r = %s', track, tf)
         if not (
             options["ce_no_run"] and (
                 not tm['~ce_file'] or tm['~ce_file'] == "None")):
             # continue
-            if self.DEBUG:
-                log.debug("%s: add_artist_info", PLUGIN_NAME)
-
-            self.track_listing.append(track)
+            if self.DEBUG or self.INFO:
+                write_log(release_id, 'debug', "ExtraArtists - add_artist_info")
+            if album not in self.track_listing or track not in self.track_listing[album]:
+                self.track_listing[album].append(track)
             # fix odd hyphens in names for consistency
             field_types = ['~albumartists', '~albumartists_sort']
             for field_type in field_types:
@@ -3133,17 +3258,14 @@ class ExtraArtists():
             if tm['discnumber'] == '1' and tm['tracknumber'] == '1':
                 # get artist aliases - these are cached so can be re-used across
                 # releases, but are reloaded with each refresh
-                get_aliases(self, album, options, releaseXmlNode)
+                get_aliases(self, release_id, album, options, releaseXmlNode)
 
                 # xml_type = 'release'
                 # get performers etc who are related at the release level
-                relation_list = parse_data(
-                    options, releaseXmlNode, [], 'relation_list')
-                album_performerList = get_artists(
-                    options, tm, relation_list, 'release')['artists']
+                relation_list = parse_data(release_id, releaseXmlNode, [], 'relation_list')
+                album_performerList = get_artists(options, release_id, tm, relation_list, 'release')['artists']
                 self.album_performers[album] = album_performerList
-                album_instrumentList = get_artists(
-                    options, tm, relation_list, 'release')['instruments']
+                album_instrumentList = get_artists(options, release_id, tm, relation_list, 'release')['instruments']
                 self.album_instruments[album] = album_instrumentList
 
             else:
@@ -3158,13 +3280,7 @@ class ExtraArtists():
                     # Should be OK to initialise these here as recording artists
                     # yet to be processed
 
-            track_artist_list = parse_data(
-                options,
-                trackXmlNode,
-                [],
-                'artist_credit',
-                'name_credit'
-            )
+            track_artist_list = parse_data(release_id, trackXmlNode, [], 'artist_credit', 'name_credit')
             if track_artist_list:
                 track_artist = []
                 track_artistsort = []
@@ -3193,18 +3309,9 @@ class ExtraArtists():
                     else:
                         name_style = []
                 if self.INFO:
-                    log.info(
-                        'Priority order of naming style for track artists = %s',
-                        name_style)
-                styled_artists = apply_artist_style(
-                    options,
-                    lang,
-                    track_artist_list,
-                    name_style,
-                    track_artist,
-                    track_artistsort,
-                    track_artists,
-                    track_artists_sort)
+                    write_log(release_id, 'info', 'Priority order of naming style for track artists = %s', name_style)
+                styled_artists = apply_artist_style(options, release_id, lang, track_artist_list, name_style,
+                                                    track_artist, track_artistsort, track_artists, track_artists_sort)
                 tm['artists'] = styled_artists['artists']
                 tm['~artists_sort'] = styled_artists['artists_sort']
                 tm['artist'] = styled_artists['artist']
@@ -3218,8 +3325,7 @@ class ExtraArtists():
                     # here
 
                     # get recording artists data
-                    recording_artist_list = parse_data(
-                        options, record, [], 'artist_credit', 'name_credit')
+                    recording_artist_list = parse_data(release_id, record, [], 'artist_credit', 'name_credit')
                     if recording_artist_list:
                         recording_artist = []
                         recording_artistsort = []
@@ -3258,30 +3364,16 @@ class ExtraArtists():
                         else:
                             name_style = []
                         if self.INFO:
-                            log.info(
-                                'Priority order of naming style for recording artists = %s', name_style)
+                            write_log(release_id, 'info', 'Priority order of naming style for recording artists = %s',
+                                      name_style)
 
-                        styled_artists = apply_artist_style(
-                            options,
-                            lang,
-                            recording_artist_list,
-                            name_style,
-                            recording_artist,
-                            recording_artistsort,
-                            recording_artists,
-                            recording_artists_sort)
-                        self.append_tag(
-                            tm, '~cea_recording_artists', styled_artists['artists'])
-                        self.append_tag(
-                            tm,
-                            '~cea_recording_artists_sort',
-                            styled_artists['artists_sort'])
-                        self.append_tag(
-                            tm, '~cea_recording_artist', styled_artists['artist'])
-                        self.append_tag(
-                            tm,
-                            '~cea_recording_artistsort',
-                            styled_artists['artistsort'])
+                        styled_artists = apply_artist_style(options, release_id, lang, recording_artist_list,
+                                                            name_style, recording_artist, recording_artistsort,
+                                                            recording_artists, recording_artists_sort)
+                        self.append_tag(release_id, tm, '~cea_recording_artists', styled_artists['artists'])
+                        self.append_tag(release_id, tm, '~cea_recording_artists_sort', styled_artists['artists_sort'])
+                        self.append_tag(release_id, tm, '~cea_recording_artist', styled_artists['artist'])
+                        self.append_tag(release_id, tm, '~cea_recording_artistsort', styled_artists['artistsort'])
 
                     else:
                         tm['~cea_recording_artists'] = ''
@@ -3320,45 +3412,34 @@ class ExtraArtists():
                                         ' (' + tm['~cea_recording_artistsort'] + ')'
 
                     # xml_type = 'recording'
-                    relation_list = parse_data(
-                        options, record, [], 'relation_list')
+                    relation_list = parse_data(release_id, record, [], 'relation_list')
                     performerList = album_performerList + \
-                        get_artists(options, tm, relation_list, 'recording')['artists']
+                                    get_artists(options, release_id, tm, relation_list, 'recording')['artists']
                     # returns
                     # [(artist type, instrument or None, artist name, artist sort name, instrument sort, type sort)]
                     # where instrument sort places solo ahead of additional etc.
                     #  and type sort applies a custom sequencing to the artist types
                     if performerList:
-                        if self.DEBUG:
-                            log.debug(
-                                "%s: Performers: %s",
-                                PLUGIN_NAME,
-                                performerList)
-                        self.set_performer(album, track, performerList, tm)
-
+                        if self.INFO:
+                            write_log(release_id, 'info', "Performers: %s", performerList)
+                        self.set_performer(release_id, album, track, performerList, tm)
                     if not options['classical_work_parts']:
-                        work_artist_list = parse_data(
-                            options,
-                            record,
-                            [],
-                            'relation_list',
-                            'attribs.target_type:work',
-                            'relation',
-                            'attribs.type:performance',
-                            'work',
-                            'relation_list',
-                            'attribs.target_type:artist')
-                        work_artists = get_artists(
-                            options, tm, work_artist_list, 'work')['artists']
-                        set_work_artists(
-                            self, album, track, work_artists, tm, 0)
+                        work_artist_list = parse_data(release_id, record, [], 'relation_list',
+                                                      'attribs.target_type:work', 'relation',
+                                                      'attribs.type:performance', 'work', 'relation_list',
+                                                      'attribs.target_type:artist')
+                        work_artists = get_artists(options, release_id, tm, work_artist_list, 'work')['artists']
+                        set_work_artists(self, release_id, album, track, work_artists, tm, 0)
                     # otherwise composers etc. will be set in work parts
+            else:
+                self.globals[track]['is_recording'] = False
         else:
             tm['000_major_warning'] = "WARNING: Classical Extras not run for this track as no file present - " \
                 "deselect the option on the advanced tab to run. If there is a file, then try 'Refresh'."
         if track_metadata['tracknumber'] == track_metadata['totaltracks'] and track_metadata[
                 'discnumber'] == track_metadata['totaldiscs']:  # last track
-            self.process_album(album)
+            self.process_album(release_id, album)
+            close_log(release_id, 'artists')
 
     # Checks for ensembles
     def ensemble_type(self, performer):
@@ -3393,56 +3474,87 @@ class ExtraArtists():
                 return 'Group'
         return False
 
-    def process_album(self, album):
+    def process_album(self, release_id, album):
         """
         Perform final processing after all tracks read
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :return:
         """
+        if self.DEBUG:
+            write_log(release_id, 'debug', 'ExtraArtists: Starting process_album')
         # process lyrics tags
+        if self.DEBUG:
+            write_log(release_id, 'debug', 'Starting lyrics processing')
         common = []
-        first = True
-        tmlyrics_list = {}
-        for track in self.track_listing:
+        tmlyrics_dict = {}
+        for track in self.track_listing[album]:
             options = self.options[track]
             if options['cea_split_lyrics'] and options['cea_lyrics_tag']:
                 tm = track.metadata
                 lyrics_tag = options['cea_lyrics_tag']
                 if tm[lyrics_tag]:
                     # turn text into word lists to speed processing
-                    tmlyrics_list[track] = tm[lyrics_tag].split()
-                    if first:
-                        common = tmlyrics_list[track]
-                        first = False
-                    else:
-                        lcs = longest_common_substring(
-                            tmlyrics_list[track], common)
-                        common = lcs['string']
+                    tmlyrics_dict[track] = tm[lyrics_tag].split()
+        if tmlyrics_dict:
+            for item in tmlyrics_dict:
+                write_log(release_id, 'info', 'tmlyrics_dict: track = %s, lyrics = %s', item, tmlyrics_dict[item])  # REMOVE
+            tmlyrics_sort = sorted(tmlyrics_dict.items(), key=operator.itemgetter(1))
+            for tup in tmlyrics_sort:
+                write_log(release_id, 'info', 'tup in tmlyrics_sort = %s', tup)  # REMOVE
+            prev = None
+            first_track = None
+            unique_lyrics = []
+            ref_track = {}
+            for lyric_tuple in tmlyrics_sort:  # tuple is (track, lyrics)
+                if lyric_tuple[1] != prev:
+                    unique_lyrics.append(lyric_tuple[1])
+                    first_track = lyric_tuple[0]
+                ref_track[lyric_tuple[0]] = first_track
+                prev = lyric_tuple[1]
+            write_log(release_id, 'info', 'Before turbo_lcs. Unique_lyrics = %r', unique_lyrics)  # REMOVE
+            common = turbo_lcs(release_id, unique_lyrics)
+            write_log(release_id, 'info', 'After turbo_lcs. Unique_lyrics = %r', unique_lyrics)  # REMOVE
+            write_log(release_id, 'info', 'After turbo_lcs. lcs list = %s', common)  # REMOVE
 
-                else:
-                    common = []
-            else:
-                common = []
         if common:
-            for track in self.track_listing:
+            unique = []
+            for tup in tmlyrics_sort:
+                track = tup[0]
+                ref = ref_track[track]
+                if track == ref:
+                    indi = True
+                else:
+                    indi = False
+                write_log(release_id, 'info', 'Ref track = %s, tup in tmlyrics_sort = %s', indi, tup)  # REMOVE
+                if track == ref:
+                    start = substart_finder(tup[1], common)
+                    length = len(common)
+                    end = min(start + length, len(tup[1]))
+                    unique = tup[1][:start] + tup[1][end:]
+
                 options = self.options[track]
                 if options['cea_split_lyrics'] and options['cea_lyrics_tag']:
                     tm = track.metadata
-                    lcs = longest_common_substring(
-                        tmlyrics_list[track], common)
-                    start = lcs['start']
-                    length = lcs['length']
-                    end = start + length
-                    unique = tmlyrics_list[track][:start] + \
-                        tmlyrics_list[track][end:]
-                    tm['~cea_track_lyrics'] = ' '.join(unique)
+                    if unique:
+                        tm['~cea_track_lyrics'] = ' '.join(unique)
                     tm['~cea_album_lyrics'] = ' '.join(common)
                     if options['cea_album_lyrics']:
                         tm[options['cea_album_lyrics']] = tm['~cea_album_lyrics']
+                    if unique and options['cea_track_lyrics']:
+                        tm[options['cea_track_lyrics']] = tm['~cea_track_lyrics']
+        else:
+            for track in self.track_listing[album]:
+                options = self.options[track]
+                if options['cea_split_lyrics'] and options['cea_lyrics_tag']:
+                    tm['~cea_track_lyrics'] = tm[options['cea_lyrics_tag']]
                     if options['cea_track_lyrics']:
                         tm[options['cea_track_lyrics']] = tm['~cea_track_lyrics']
+        if self.DEBUG:
+            write_log(release_id, 'debug', 'Ending lyrics processing')
 
-        for track in self.track_listing:
+        for track in self.track_listing[album]:
             options = self.options[track]
             tm = track.metadata
             tm['~cea_version'] = PLUGIN_VERSION
@@ -3458,7 +3570,7 @@ class ExtraArtists():
                         and '~artists_sort' in tm and 'composersort' in tm
                         and any(x in tm['~artists_sort'] for x in tm['composersort'])
                         and 'writer' not in tm):
-                    self.append_tag(tm, '~cea_work_type', 'Classical')
+                    self.append_tag(release_id, tm, '~cea_work_type', 'Classical')
 
                 if isinstance(tm['~cea_soloists'], basestring):
                     soloists = re.split(
@@ -3482,68 +3594,60 @@ class ExtraArtists():
                     large = False
                     if 'performer:orchestra' in tm:
                         large = True
-                        self.append_tag(tm, '~cea_work_type_if_classical', 'Orchestral')
+                        self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Orchestral')
                         if '~cea_soloists' in tm:
                             if 'vocals' in tm['~cea_instruments_all']:
-                                self.append_tag(tm, '~cea_work_type', 'Vocal')
+                                self.append_tag(release_id, tm, '~cea_work_type', 'Vocal')
                             if len(soloists) == 1:
                                 if soloists != vocalists:
-                                    self.append_tag(
-                                        tm, '~cea_work_type_if_classical', 'Concerto')
+                                    self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Concerto')
                                 else:
-                                    self.append_tag(
-                                        tm, '~cea_work_type_if_classical', 'Aria')
+                                    self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Aria')
                             elif len(soloists) == 2:
-                                self.append_tag(tm, '~cea_work_type_if_classical', 'Duet')
+                                self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Duet')
                                 if not vocalists:
-                                    self.append_tag(
-                                        tm, '~cea_work_type_if_classical', 'Concerto')
+                                    self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Concerto')
                             elif len(soloists) == 3:
-                                self.append_tag(tm, '~cea_work_type_if_classical', 'Trio')
+                                self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Trio')
                             elif len(soloists) == 4:
-                                self.append_tag(tm, '~cea_work_type_if_classical', 'Quartet')
+                                self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Quartet')
 
                     if 'performer:choir' in tm or 'performer:choir vocals' in tm:
                         large = True
-                        self.append_tag(tm, '~cea_work_type_if_classical', 'Choral')
-                        self.append_tag(tm, '~cea_work_type', 'Vocal')
+                        self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Choral')
+                        self.append_tag(release_id, tm, '~cea_work_type', 'Vocal')
                     else:
                         if large and 'soloists' in tm and tm['soloists'].count(
                                 'vocals') > 1:
-                            self.append_tag(tm, '~cea_work_type_if_classical', 'Opera')
+                            self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Opera')
                     if not large:
                         if '~cea_soloists' not in tm:
-                            self.append_tag(tm, '~cea_work_type_if_classical', 'Chamber music')
+                            self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Chamber music')
                         else:
                             if vocalists:
-                                self.append_tag(tm, '~cea_work_type', 'Song')
-                                self.append_tag(tm, '~cea_work_type', 'Vocal')
+                                self.append_tag(release_id, tm, '~cea_work_type', 'Song')
+                                self.append_tag(release_id, tm, '~cea_work_type', 'Vocal')
                             else:
-                                self.append_tag(
-                                    tm, '~cea_work_type_if_classical', 'Chamber music')
+                                self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Chamber music')
                 else:
                     if len(soloists) == 1:
                             if vocalists != soloists:
-                                self.append_tag(
-                                    tm, '~cea_work_type', 'Instrumental')
+                                self.append_tag(release_id, tm, '~cea_work_type', 'Instrumental')
                             else:
-                                self.append_tag(
-                                    tm, '~cea_work_type', 'Song')
-                                self.append_tag(
-                                    tm, '~cea_work_type', 'Vocal')
+                                self.append_tag(release_id, tm, '~cea_work_type', 'Song')
+                                self.append_tag(release_id, tm, '~cea_work_type', 'Vocal')
                     elif len(soloists) == 2:
-                        self.append_tag(tm, '~cea_work_type_if_classical', 'Duet')
+                        self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Duet')
                     elif len(soloists) == 3:
-                        self.append_tag(tm, '~cea_work_type_if_classical', 'Trio')
+                        self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Trio')
                     elif len(soloists) == 4:
-                        self.append_tag(tm, '~cea_work_type_if_classical', 'Quartet')
+                        self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Quartet')
                     else:
                         if not vocalists:
-                            self.append_tag(
-                                tm, '~cea_work_type_if_classical', 'Chamber music')
+                            self.append_tag(release_id, tm, '~cea_work_type_if_classical', 'Chamber music')
                         else:
-                            self.append_tag(tm, '~cea_work_type', 'Song')
-                            self.append_tag(tm, '~cea_work_type', 'Vocal')
+                            self.append_tag(release_id, tm, '~cea_work_type', 'Song')
+                            self.append_tag(release_id, tm, '~cea_work_type', 'Vocal')
             # blank tags
             if 'artists_sort' in [x.strip() for x in blank_tags]:
                 blank_tags.append('~artists_sort')
@@ -3558,14 +3662,13 @@ class ExtraArtists():
             if not options['classical_work_parts']:
                 if 'composer_lastnames' in self.album_artists[album]:
                     last_names = seq_last_names(self, album)
-                    self.append_tag(
-                        tm, '~cea_album_composer_lastnames', last_names)
+                    self.append_tag(release_id, tm, '~cea_album_composer_lastnames', last_names)
             # otherwise this is done in the workparts class, which has all
             # composer info
 
             # process tag mapping
             tm['~cea_artists_complete'] = "Y"
-            map_tags(options, album, tm)
+            map_tags(options, release_id, album, tm)
 
             # write out options and errors/warnings to tags
             if options['cea_options_tag'] != "":
@@ -3589,41 +3692,37 @@ class ExtraArtists():
                                                                                 ][name_list[1]] = options[opt['option']]
 
                 if options['ce_version_tag'] and options['ce_version_tag'] != "":
-                    self.append_tag(
-                        tm,
-                        options['ce_version_tag'],
-                        unicode(
-                            'Version ' +
-                            tm['~cea_version'] +
-                            ' of Classical Extras'))
+                    self.append_tag(release_id, tm, options['ce_version_tag'], unicode(
+                        'Version ' +
+                        tm['~cea_version'] +
+                        ' of Classical Extras'))
                 if options['cea_options_tag'] and options['cea_options_tag'] != "":
-                    self.append_tag(
-                        tm,
-                        options['cea_options_tag'] +
-                        ':artists_options',
-                        json.loads(
-                            json.dumps(
-                                self.cea_options)))
-        self.track_listing = []
+                    self.append_tag(release_id, tm, options['cea_options_tag'] +
+                                    ':artists_options', json.loads(
+                        json.dumps(
+                            self.cea_options)))
+        self.track_listing[album] = []
         if self.INFO:
-            log.info(
-                "FINISHED Classical Extra Artists. Album: %s",
-                album)
+            write_log(release_id, 'info', "FINISHED Classical Extra Artists. Album: %s", album)
 
-    def append_tag(self, tm, tag, source):
+    def append_tag(self, release_id, tm, tag, source):
         """
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param tm:
         :param tag:
         :param source:
         :return:
         """
         if self.INFO:
-            log.info("Extra Artists - appending %s to %s", source, tag)
-        append_tag(tm, tag, source, self.SEPARATORS)
+            write_log(release_id, 'info', "Extra Artists - appending %s to %s", source, tag)
+        append_tag(release_id, tm, tag, source, self.SEPARATORS)
 
-    def set_performer(self, album, track, performerList, tm):
+    def set_performer(self, release_id, album, track, performerList, tm):
         """
         Sets the performer-related tags
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :param track:
         :param performerList: see below
@@ -3633,11 +3732,11 @@ class ExtraArtists():
         # performerList is in format [(artist_type, [instrument list],[name list],[sort_name list],
         # instrument_sort, type_sort),(.....etc]
         # Sorted by type_sort then sort name then instrument_sort
-        if self.DEBUG:
-            log.debug("Extra Artists - set_performer")
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Extra Artists - set_performer")
         if self.INFO:
-            log.info("Performer list is:")
-            log.info(performerList)
+            write_log(release_id, 'info', "Performer list is:")
+            write_log(release_id, 'info', performerList)
         options = self.options[track]
         # tag strings are a tuple (Picard tag, cea tag, Picard sort tag, cea
         # sort tag)
@@ -3697,20 +3796,16 @@ class ExtraArtists():
                             artist_inst.append(instrument)
                         else:
                             if inst_list == last_inst_list:
-                                if self.WARNING:
-                                    log.warning(
-                                        'Duplicated performer information for %s'
-                                        ' (may be in Release Relationship as well as Track Relationship).'
-                                        ' Duplicates have been ignored.',
-                                        performer[3])
-                                    self.append_tag(
-                                        tm,
-                                        '~cea_warning',
-                                        '2. Duplicated performer information for "' +
-                                        '; '.join(
-                                            performer[3]) +
-                                        '" (may be in Release Relationship as well as Track Relationship).'
-                                        ' Duplicates have been ignored.')
+                                if self.WARNING or self.INFO:
+                                    write_log(release_id, 'warning', 'Duplicated performer information for %s'
+                                                                     ' (may be in Release Relationship as well as Track Relationship).'
+                                                                     ' Duplicates have been ignored.', performer[3])
+                                    self.append_tag(release_id, tm, '~cea_warning',
+                                                    '2. Duplicated performer information for "' +
+                                                    '; '.join(
+                                                        performer[3]) +
+                                                    '" (may be in Release Relationship as well as Track Relationship).'
+                                                    ' Duplicates have been ignored.')
                     else:
                         artist_inst = [instrument]
                         last_artist = performer[3]
@@ -3783,20 +3878,17 @@ class ExtraArtists():
                 if sub_strings[artist_type]:
                     tag += sub_strings[artist_type]
                 else:
-                    if self.WARNING:
-                        log.warning(
-                            '%s: No instrument/sub-key available for artist_type %s. Performer = %s. Track is %s',
-                            PLUGIN_NAME,
-                            artist_type,
-                            performer[2],
-                            track)
+                    if self.WARNING or self.INFO:
+                        write_log(release_id, 'warning',
+                                  'No instrument/sub-key available for artist_type %s. Performer = %s. Track is %s',
+                                  artist_type, performer[2], track)
 
             if tag:
                 if '~ce_tag_cleared_' + \
                         tag not in tm or not tm['~ce_tag_cleared_' + tag] == "Y":
                     if tag in tm:
                         if self.INFO:
-                            log.info('delete tag %s', tag)
+                            write_log(release_id, 'info', 'delete tag %s', tag)
                         del tm[tag]
                 tm['~ce_tag_cleared_' + tag] = "Y"
             if sort_tag:
@@ -3839,69 +3931,60 @@ class ExtraArtists():
                     if annotations[artist_type]:
                         annotated_name += ' (' + annotations[artist_type] + ')'
                     else:
-                        if self.WARNING:
-                            log.warning(
-                                '%s: No annotation (instrument) available for artist_type %s.'
-                                ' Performer = %s. Track is %s',
-                                PLUGIN_NAME,
-                                artist_type,
-                                performer[2],
-                                track)
+                        if self.WARNING or self.INFO:
+                            write_log(release_id, 'warning',
+                                      'No annotation (instrument) available for artist_type %s.'
+                                      ' Performer = %s. Track is %s', artist_type, performer[2], track)
                 if artist_type in insertions and options['cea_arrangers']:
-                    self.append_tag(tm, tag, annotated_name)
+                    self.append_tag(release_id, tm, tag, annotated_name)
                 else:
                     if options['cea_arrangers'] or artist_type == tag:
-                        self.append_tag(tm, tag, name)
+                        self.append_tag(release_id, tm, tag, name)
 
                 if options['cea_arrangers'] or artist_type == tag:
                     if sort_tag:
-                        self.append_tag(tm, sort_tag, sort_name)
+                        self.append_tag(release_id, tm, sort_tag, sort_name)
                         if options['cea_tag_sort'] and '~' in sort_tag:
                             explicit_sort_tag = sort_tag.replace('~', '')
-                            self.append_tag(tm, explicit_sort_tag, sort_name)
+                            self.append_tag(release_id, tm, explicit_sort_tag, sort_name)
 
-                self.append_tag(tm, cea_tag, annotated_name)
+                self.append_tag(release_id, tm, cea_tag, annotated_name)
                 # if artist_type not in [
                 #         'instrument', 'vocal', 'performing orchestra']:
                 #     self.append_tag(tm, cea_names_tag, instrumented_name)
                 # else:
                 #     self.append_tag(tm, cea_names_tag, name)
-                self.append_tag(tm, cea_names_tag, name)
+                self.append_tag(release_id, tm, cea_names_tag, name)
                 if instrumented_name != name:
-                    self.append_tag(tm, cea_instrumented_tag, instrumented_name)
+                    self.append_tag(release_id, tm, cea_instrumented_tag, instrumented_name)
 
                 if cea_sort_tag:
-                    self.append_tag(tm, cea_sort_tag, sort_name)
+                    self.append_tag(release_id, tm, cea_sort_tag, sort_name)
 
                 # differentiate soloists etc and write related tags
                 if artist_type == 'performing orchestra' or (
                         instrument and instrument in self.ENSEMBLE_TYPES) or self.ensemble_type(name):
                     performer_type = 'ensembles'
-                    self.append_tag(tm, '~cea_ensembles', instrumented_name)
-                    self.append_tag(tm, '~cea_ensemble_names', name)
-                    self.append_tag(tm, '~cea_ensembles_sort', sort_name)
+                    self.append_tag(release_id, tm, '~cea_ensembles', instrumented_name)
+                    self.append_tag(release_id, tm, '~cea_ensemble_names', name)
+                    self.append_tag(release_id, tm, '~cea_ensembles_sort', sort_name)
                 elif artist_type in ['performer', 'instrument', 'vocal']:
                     performer_type = 'soloists'
-                    self.append_tag(tm, '~cea_soloists', instrumented_name)
-                    self.append_tag(tm, '~cea_soloist_names', name)
-                    self.append_tag(tm, '~cea_soloists_sort', sort_name)
+                    self.append_tag(release_id, tm, '~cea_soloists', instrumented_name)
+                    self.append_tag(release_id, tm, '~cea_soloist_names', name)
+                    self.append_tag(release_id, tm, '~cea_soloists_sort', sort_name)
                     if artist_type == "vocal":
-                        self.append_tag(
-                            tm, '~cea_vocalists', instrumented_name)
-                        self.append_tag(tm, '~cea_vocalist_names', name)
-                        self.append_tag(tm, '~cea_vocalists_sort', sort_name)
+                        self.append_tag(release_id, tm, '~cea_vocalists', instrumented_name)
+                        self.append_tag(release_id, tm, '~cea_vocalist_names', name)
+                        self.append_tag(release_id, tm, '~cea_vocalists_sort', sort_name)
                     elif instrument:
-                        self.append_tag(
-                            tm, '~cea_instrumentalists', instrumented_name)
-                        self.append_tag(tm, '~cea_instrumentalist_names', name)
-                        self.append_tag(
-                            tm, '~cea_instrumentalists_sort', sort_name)
+                        self.append_tag(release_id, tm, '~cea_instrumentalists', instrumented_name)
+                        self.append_tag(release_id, tm, '~cea_instrumentalist_names', name)
+                        self.append_tag(release_id, tm, '~cea_instrumentalists_sort', sort_name)
                     else:
-                        self.append_tag(
-                            tm, '~cea_other_soloists', instrumented_name)
-                        self.append_tag(tm, '~cea_other_soloist_names', name)
-                        self.append_tag(
-                            tm, '~cea_other_soloists_sort', sort_name)
+                        self.append_tag(release_id, tm, '~cea_other_soloists', instrumented_name)
+                        self.append_tag(release_id, tm, '~cea_other_soloist_names', name)
+                        self.append_tag(release_id, tm, '~cea_other_soloists_sort', sort_name)
 
                 # set album artists
                 if performer_type or artist_type == 'conductor':
@@ -3913,16 +3996,13 @@ class ExtraArtists():
                         'performers', performer_type)
                     if stripsir(name) in tm['~albumartists'] or stripsir(
                             sort_name) in tm['~albumartists_sort']:
-                        self.append_tag(tm, cea_album_tag, name)
-                        self.append_tag(tm, cea_album_sort_tag, sort_name)
+                        self.append_tag(release_id, tm, cea_album_tag, name)
+                        self.append_tag(release_id, tm, cea_album_sort_tag, sort_name)
                     else:
                         if performer_type:
-                            self.append_tag(
-                                tm, '~cea_support_performers', instrumented_name)
-                            self.append_tag(
-                                tm, '~cea_support_performer_names', name)
-                            self.append_tag(
-                                tm, '~cea_support_performers_sort', sort_name)
+                            self.append_tag(release_id, tm, '~cea_support_performers', instrumented_name)
+                            self.append_tag(release_id, tm, '~cea_support_performer_names', name)
+                            self.append_tag(release_id, tm, '~cea_support_performers_sort', sort_name)
 
 ##############
 ##############
@@ -4050,31 +4130,34 @@ class PartLevels():
         :param releaseXmlNode:
         :return:
         """
+        release_id = track_metadata['musicbrainz_albumid']
+        if 'start' not in release_status[release_id]:
+            release_status[release_id]['start'] = datetime.now()
+        if 'lookups' not in release_status[release_id]:
+            release_status[release_id]['lookups'] = 0
+        release_status[release_id]['name'] = track_metadata['album']
+        release_status[release_id]['works'] = True
+        write_log(release_id, 'debug', 'STARTING WORKS PROCESSING FOR ALBUM %s, TRACK %s',
+                  track_metadata['album'], track_metadata['tracknumber'] + ' ' + track_metadata['title'])
         # clear the cache if required (if this is not done, then queue count may get out of sync)
         # Jump through hoops to get track object!!
         track = album._new_tracks[-1]
         tm = track.metadata
         if config.setting['log_debug']:
-            log.debug(
-                '%s: Cache setting for track %s is %s',
-                PLUGIN_NAME,
-                track,
-                config.setting['use_cache'])
+            write_log(release_id, 'debug', 'Cache setting for track %s is %s', track,
+                      config.setting['use_cache'])
 
         # OPTIONS - OVER-RIDE IF REQUIRED
         if '~ce_options' not in tm:
-            # log.debug('%s: Workparts gets track first...', PLUGIN_NAME)
-            get_options(album, track)
+            write_log(release_id, 'debug', 'Workparts gets track first...')
+            get_options(release_id, album, track)
         options = interpret(tm['~ce_options'])
 
         if not options:
             if config.setting["log_error"]:
-                log.error(
-                    '%s: Work Parts. Failure to re-read options for track %s. options = %s',
-                    PLUGIN_NAME,
-                    track,
-                    tm['~ce_options'])
-            options = config.setting
+                write_log(release_id, 'error', 'Work Parts. Failure to read saved options for track %s. options = %s',
+                          track, tm['~ce_options'])
+            options = option_settings(config.setting)
         self.options[track] = options
 
         # CONSTANTS
@@ -4085,7 +4168,7 @@ class PartLevels():
         self.SEPARATORS = ['; ']
         self.EQ = "EQ_TO_BE_REVERSED"  # phrase to indicate that a synonym has been used
 
-        self.get_sk_tags(album, track, tm, options)
+        self.get_sk_tags(release_id, album, track, tm, options)
 
         # Continue?
         if not options["classical_work_parts"]:
@@ -4107,14 +4190,14 @@ class PartLevels():
         # changed to be this repeated name and will therefore also include PARTIAL_TEXT.
         # So we need to add PARTIAL_TEXT to the prefixes list to ensure it is
         # excluded from the level 1  work name.
-        if self.DEBUG:
-            log.debug("%s: LOAD NEW TRACK: :%s", PLUGIN_NAME, track)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "PartLevels - LOAD NEW TRACK: :%s", track)
 
         # first time for this album (reloads each refresh)
         if tm['discnumber'] == '1' and tm['tracknumber'] == '1':
             # get artist aliases - these are cached so can be re-used across
             # releases, but are reloaded with each refresh
-            get_aliases(self, album, options, releaseXmlNode)
+            get_aliases(self, release_id, album, options, releaseXmlNode)
 
         # fix titles which include composer name
         composersort = dict.get(track_metadata, 'composersort', [])
@@ -4135,7 +4218,7 @@ class PartLevels():
                 track_metadata['~cwp_title'] = title_split[1]
 
         # now process works
-
+        write_log(release_id, 'info', 'PartLevels - add_work_info - metadata load = %r', track_metadata)
         workIds = dict.get(track_metadata, 'musicbrainz_workid', [])
         if workIds and not (options["ce_no_run"] and (
                 not tm['~ce_file'] or tm['~ce_file'] == "None")):
@@ -4151,8 +4234,7 @@ class PartLevels():
                     'attribs.target_type:work',
                     'relation',
                     'target.text:' + workId]
-                rels = parse_data(
-                    options, trackXmlNode, [], *match_tree)
+                rels = parse_data(release_id, trackXmlNode, [], *match_tree)
                 # for recordings which are ordered within track:-
                 match_tree_1 = [
                     'ordering_key',
@@ -4168,11 +4250,10 @@ class PartLevels():
                     'direction.text:backward',
                     'ordering_key',
                     'text']
-                parse_result = parse_data(
-                    options, rels, [], *match_tree_1) + parse_data(
-                    options, rels, [], *match_tree_2)
+                parse_result = parse_data(release_id, rels, [], *match_tree_1) + parse_data(release_id, rels, [],
+                                                                                            *match_tree_2)
                 if self.INFO:
-                    log.info('multi-works - ordering key: %s', parse_result)
+                    write_log(release_id, 'info', 'multi-works - ordering key: %s', parse_result)
                 if parse_result and parse_result[0].isdigit():
                     key = int(parse_result[0])
                 else:
@@ -4181,27 +4262,12 @@ class PartLevels():
             partial = False
             for key in sorted(keyed_workIds.iterkeys()):
                 workId = keyed_workIds[key]
-                work_rels = parse_data(
-                    options,
-                    trackXmlNode,
-                    [],
-                    'recording',
-                    'relation_list',
-                    'attribs.target_type:work',
-                    'relation',
-                    'target.text:' +
-                    workId)
-                work_attributes = parse_data(
-                    options, work_rels, [], 'attribute_list', 'attribute', 'text')
-                work_titles = parse_data(
-                    options,
-                    work_rels,
-                    [],
-                    'work',
-                    'attribs.id:' +
-                    workId,
-                    'title',
-                    'text')
+                work_rels = parse_data(release_id, trackXmlNode, [], 'recording', 'relation_list',
+                                       'attribs.target_type:work', 'relation', 'target.text:' +
+                                       workId)
+                work_attributes = parse_data(release_id, work_rels, [], 'attribute_list', 'attribute', 'text')
+                work_titles = parse_data(release_id, work_rels, [], 'work', 'attribs.id:' +
+                                         workId, 'title', 'text')
                 work_list_info_item = {
                     'id': workId,
                     'attributes': work_attributes,
@@ -4224,13 +4290,9 @@ class PartLevels():
                             partwork = w
                             works.append(partwork)
 
-                        if self.DEBUG:
-                            log.debug(
-                                "%s: Id %s is PARTIAL RECORDING OF id: %s, name: %s",
-                                PLUGIN_NAME,
-                                workId,
-                                parentId,
-                                work)
+                        if self.INFO:
+                            write_log(release_id, 'info', "Id %s is PARTIAL RECORDING OF id: %s, name: %s",
+                                      workId, parentId, work)
                         work_list_info_item = {
                             'id': workId,
                             'attributes': [],
@@ -4238,7 +4300,7 @@ class PartLevels():
                             'parent': parentId}
                         work_list_info.append(work_list_info_item)
             if self.INFO:
-                log.info('work_list_info: %s', work_list_info)
+                write_log(release_id, 'info', 'work_list_info: %s', work_list_info)
             # we now have a list of items, where the id of each is a work id for the track or
             #  (multiple instances of) the recording id (for partial works)
             # we need to turn this into a usable hierarchy - i.e. just one item
@@ -4269,10 +4331,10 @@ class PartLevels():
 
             workId_tuple = tuple(workId_list)
             workId_tuple_p = tuple(workId_list_p)
+            if workId_tuple not in self.work_listing[album]:
+                self.work_listing[album].append(workId_tuple)
             if workId_tuple not in self.parts or not self.USE_CACHE:
                 self.parts[workId_tuple]['name'] = work_list
-                if workId_tuple not in self.work_listing[album]:
-                    self.work_listing[album].append(workId_tuple)
                 if parent_list:
                     if workId_tuple in self.works_cache:
                         self.works_cache[workId_tuple] += parent_list
@@ -4301,19 +4363,14 @@ class PartLevels():
                         (track, album))
             else:
                 self.trackback[album][workId_tuple]['meta'] = [(track, album)]
-            if self.DEBUG:
-                log.debug(
-                    "Trackback for %s is %s. Partial = %s",
-                    track,
-                    self.trackback[album][workId_tuple],
-                    partial)
+            if self.INFO:
+                write_log(release_id, 'info', "Trackback for %s is %s. Partial = %s", track,
+                          self.trackback[album][workId_tuple], partial)
 
             if workId_tuple in self.works_cache and (
                     self.USE_CACHE or partial):
-                if self.DEBUG:
-                    log.debug(
-                        "%s: GETTING WORK METADATA FROM CACHE",
-                        PLUGIN_NAME)  # debug
+                if self.DEBUG or self.INFO:
+                    write_log(release_id, 'debug', "GETTING WORK METADATA FROM CACHE, for work %s", workId_tuple)
                 if workId_tuple not in self.work_listing[album]:
                     self.work_listing[album].append(workId_tuple)
                 not_in_cache = self.check_cache(
@@ -4327,18 +4384,12 @@ class PartLevels():
                 if not self.USE_CACHE:
                     if workId_tuple in self.works_cache:
                         del self.works_cache[workId_tuple]
-                self.work_not_in_cache(album, track, workId_tuple)
+                self.work_not_in_cache(release_id, album, track, workId_tuple)
 
         else:  # no work relation
-            if self.WARNING:
-                log.warning(
-                    "%s: WARNING - no works for this track: \"%s\"",
-                    PLUGIN_NAME,
-                    title)
-            self.append_tag(
-                track_metadata,
-                '~cwp_warning',
-                '3. No works for this track')
+            if self.WARNING or self.INFO:
+                write_log(release_id, 'warning', "WARNING - no works for this track: \"%s\"", title)
+            self.append_tag(release_id, track_metadata, '~cwp_warning', '3. No works for this track')
             if album in self.orphan_tracks:
                 if track not in self.orphan_tracks[album]:
                     self.orphan_tracks[album].append(track)
@@ -4347,23 +4398,21 @@ class PartLevels():
             # Don't publish metadata yet until all album is processed
 
         # last track
-        if self.DEBUG:
-            log.debug(
-                '%s, Check for last track. Requests = %s, Tracknumber = %s, Totaltracks = %s,'
-                ' Discnumber = %s, Totaldiscs = %s',
-                PLUGIN_NAME,
-                album._requests,
-                track_metadata['tracknumber'],
-                track_metadata['totaltracks'],
-                track_metadata['discnumber'],
-                track_metadata['totaldiscs'])
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug',
+                      'Check for last track. Requests = %s, Tracknumber = %s, Totaltracks = %s,'
+                      ' Discnumber = %s, Totaldiscs = %s', album._requests, track_metadata['tracknumber'],
+                      track_metadata['totaltracks'], track_metadata['discnumber'], track_metadata['totaldiscs'])
         if album._requests == 0 and track_metadata['tracknumber'] == track_metadata[
                 'totaltracks'] and track_metadata['discnumber'] == track_metadata['totaldiscs']:
-            self.process_album(album)
+            self.process_album(release_id, album)
+            close_log(release_id, 'works')
 
-    def get_sk_tags(self, album, track, tm, options):
+    def get_sk_tags(self, release_id, album, track, tm, options):
         """
         Get file tags which are consistent with SongKong's metadata usage
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :param track:
         :param tm:
@@ -4383,32 +4432,26 @@ class PartLevels():
                                         'musicbrainz_work']:
                                 # Picard may have overwritten SongKong tag (top
                                 # work id) with bottom work id
-                                if self.WARNING:
-                                    log.warning(
-                                        '%s: File tag musicbrainz_workid incorrect? id = %s. Sourcing from MB',
-                                        PLUGIN_NAME,
-                                        orig_metadata['musicbrainz_workid'])
-                                self.append_tag(
-                                    tm,
-                                    '~cwp_warning',
-                                    '4. File tag musicbrainz_workid incorrect? id = ' +
-                                    orig_metadata['musicbrainz_workid'] +
-                                    '. Sourcing from MB')
+                                if self.WARNING or self.INFO:
+                                    write_log(release_id, 'warning',
+                                              'File tag musicbrainz_workid incorrect? id = %s. Sourcing from MB',
+                                              orig_metadata['musicbrainz_workid'])
+                                self.append_tag(release_id, tm, '~cwp_warning',
+                                                '4. File tag musicbrainz_workid incorrect? id = ' +
+                                                orig_metadata['musicbrainz_workid'] +
+                                                '. Sourcing from MB')
                                 return None
                         if self.INFO:
-                            log.info(
-                                'Read from file tag: musicbrainz_work_composition_id: %s',
-                                orig_metadata['musicbrainz_work_composition_id'])
+                            write_log(release_id, 'info', 'Read from file tag: musicbrainz_work_composition_id: %s',
+                                      orig_metadata['musicbrainz_work_composition_id'])
                         self.file_works[(album, track)].append({
                             'workid': orig_metadata['musicbrainz_work_composition_id'].split('; '),
                             'name': orig_metadata['musicbrainz_work_composition']})
                     else:
                         wid = orig_metadata['musicbrainz_work_composition_id']
-                        if self.ERROR:
-                            log.error(
-                                "%s: No matching work name for id tag %s", PLUGIN_NAME, wid)
-                        self.append_tag(
-                            tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
+                        if self.ERROR or self.INFO:
+                            write_log(release_id, 'error', "No matching work name for id tag %s", wid)
+                        self.append_tag(release_id, tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
                         return None
                     n = 1
                     while 'musicbrainz_work_part_level' + \
@@ -4423,11 +4466,10 @@ class PartLevels():
                         else:
                             wid = orig_metadata['musicbrainz_work_part_level' +
                                                 unicode(n) + '_id']
-                            if self.ERROR:
-                                log.error(
-                                    "%s: No matching work name for id tag %s", PLUGIN_NAME, wid)
-                            self.append_tag(
-                                tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
+                            if self.ERROR or self.INFO:
+                                write_log(release_id, 'error', "No matching work name for id tag %s",
+                                          wid)
+                            self.append_tag(release_id, tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
                             break
                     if orig_metadata['musicbrainz_work_composition_id'] != orig_metadata[
                             'musicbrainz_workid']:
@@ -4437,16 +4479,14 @@ class PartLevels():
                                 'name': orig_metadata['musicbrainz_work']})
                         else:
                             wid = orig_metadata['musicbrainz_workid']
-                            if self.ERROR:
-                                log.error(
-                                    "%s: No matching work name for id tag %s", PLUGIN_NAME, wid)
-                            self.append_tag(
-                                tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
+                            if self.ERROR or self.INFO:
+                                write_log(release_id, 'error', "No matching work name for id tag %s", wid)
+                            self.append_tag(release_id, tm, '~cwp_error', '2. No matching work name for id tag ' + wid)
                             return None
                     file_work_levels = len(self.file_works[(album, track)])
-                    if self.DEBUG:
-                        log.debug('%s: Loaded works from file tags for track %s. Works: %s: ',
-                                  PLUGIN_NAME, track, self.file_works[(album, track)])
+                    if self.DEBUG or self.INFO:
+                        write_log(release_id, 'debug', 'Loaded works from file tags for track %s. Works: %s: ',
+                                  track, self.file_works[(album, track)])
                     for i, work in enumerate(self.file_works[(album, track)]):
                         workId = tuple(work['workid'])
                         if workId not in self.works_cache:  # Use cache in preference to file tags
@@ -4493,16 +4533,20 @@ class PartLevels():
             not_in_cache.append(parentId_tuple)
         return not_in_cache
 
-    def work_not_in_cache(self, album, track, workId_tuple):
+    def work_not_in_cache(self, release_id, album, track, workId_tuple):
         """
         Determine actions if work not in cache (is it the top or do we need to look up?)
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :param track:
         :param workId_tuple:
         :return:
         """
+        write_log(release_id, 'debug', 'Processing work_not_in_cache for workId %s', workId_tuple)
         if 'no_parent' in self.parts[workId_tuple] and (
                 self.USE_CACHE or self.options[track]["cwp_use_sk"]) and self.parts[workId_tuple]['no_parent']:
+            write_log(release_id, 'info', '%s is top work', workId_tuple)
             self.top_works[(track, album)]['workId'] = workId_tuple
             if album in self.top:
                 if workId_tuple not in self.top[album]:
@@ -4510,8 +4554,10 @@ class PartLevels():
             else:
                 self.top[album] = [workId_tuple]
         else:
+            write_log(release_id, 'info', 'Calling work_add_track to look up parents for %s', workId_tuple)
             for workId in workId_tuple:
                 self.work_add_track(album, track, workId, 0)
+        write_log(release_id, 'debug', 'End of work_not_in_cache for workId %s', workId_tuple)
 
     def work_add_track(self, album, track, workId, tries, user_data=True):
         """
@@ -4523,17 +4569,15 @@ class PartLevels():
         :param tries: number of lookup attempts
         :return:
         """
-        if self.DEBUG:
-            log.debug("%s: ADDING WORK TO LOOKUP QUEUE", PLUGIN_NAME)
-        self.album_add_request(album)
+        release_id = track.metadata['musicbrainz_albumid']
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "ADDING WORK TO LOOKUP QUEUE for work %s", workId)
+        self.album_add_request(release_id, album)
         # to change the _requests variable to indicate that there are pending
         # requests for this item and delay Picard from finalizing the album
-        if self.DEBUG:
-            log.debug(
-                "%s: Added lookup request for id %s. Requests = %s",
-                PLUGIN_NAME,
-                workId,
-                album._requests)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Added lookup request for id %s. Requests = %s", workId,
+                      album._requests)
         if self.works_queue.append(
                 workId,
                 (track,
@@ -4552,11 +4596,10 @@ class PartLevels():
                 login = False
                 tag_type = ''
             queryargs = {"inc": "work-rels+artist-rels+label-rels+place-rels+aliases" + tag_type}
-            if self.DEBUG:
-                log.debug(
-                    "%s: Initiating XML lookup for %s......",
-                    PLUGIN_NAME,
-                    workId)
+            if self.DEBUG or self.INFO:
+                write_log(release_id, 'debug', "Initiating XML lookup for %s......", workId)
+            if release_id in release_status and 'lookups' in release_status[release_id]:
+                release_status[release_id]['lookups'] += 1
             return album.tagger.xmlws.get(
                 host,
                 port,
@@ -4571,15 +4614,20 @@ class PartLevels():
                 mblogin=login,
                 queryargs=queryargs)
         else:
-            if self.DEBUG:
-                log.debug(
-                    "%s: Work is already in queue: %s",
-                    PLUGIN_NAME,
-                    workId)
+            if self.DEBUG or self.INFO:
+                write_log(release_id, 'debug', "Work is already in queue: %s", workId)
+
+    #####################################################################################
+    # SECTION 2 - Works processing                                                      #
+    # NB These functions may operate over multiple albums (as well as multiple tracks)  #
+    #####################################################################################
 
     def work_process(self, workId, tries, response, reply, error):
         """
         Top routine to process the XML node response from the lookup
+        NB This function may operate over multiple albums (as well as multiple tracks)
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param workId:
         :param tries:
         :param response:
@@ -4587,394 +4635,275 @@ class PartLevels():
         :param error:
         :return:
         """
-        if self.DEBUG:
-            log.debug(
-                "%s: work_process. LOOKING UP WORK: %s",
-                PLUGIN_NAME,
-                workId)
         if error:
-            if self.WARNING:
-                log.warning(
-                    "%s: %r: Network error retrieving work record. Error code %r",
-                    PLUGIN_NAME,
-                    workId,
-                    error)
             tuples = self.works_queue.remove(workId)
             for track, album in tuples:
-                if self.DEBUG:
-                    log.debug(
-                        "%s: Removed request after network error. Requests = %s",
-                        PLUGIN_NAME,
-                        album._requests)
+                release_id = track.metadata['musicbrainz_albumid']
+                if self.WARNING or self.INFO:
+                    write_log(release_id, 'warning', "%r: Network error retrieving work record. Error code %r",
+                              workId, error)
+                if self.DEBUG or self.INFO:
+                    write_log(release_id, 'debug', "Removed request after network error. Requests = %s",
+                              album._requests)
                 if tries < self.MAX_RETRIES:
                     user_data = True
-                    if self.DEBUG:
-                        log.debug("REQUEUEING...")
+                    if self.DEBUG or self.INFO:
+                        write_log(release_id, 'debug', "REQUEUEING...")
                     if str(error) == '204':  # Authentication error
-                        if self.DEBUG:
-                            log.debug("... without user authentication")
+                        if self.DEBUG or self.INFO:
+                            write_log(release_id, 'debug', "... without user authentication")
                         user_data = False
-                        self.append_tag(
-                            track.metadata,
-                            '~cwp_error',
-                            '3. Authentication failure - data retrieval omits user-specific requests')
-                    self.work_add_track(
-                        album, track, workId, tries + 1, user_data)
+                        self.append_tag(release_id, track.metadata, '~cwp_error',
+                                        '3. Authentication failure - data retrieval omits user-specific requests')
+                    self.work_add_track(album, track, workId, tries + 1, user_data)
                 else:
-                    if self.ERROR:
-                        log.error(
-                            "%s: EXHAUSTED MAX RE-TRIES for XML lookup for track %s",
-                            PLUGIN_NAME,
-                            track)
-                        self.append_tag(
-                            track.metadata,
-                            '~cwp_error',
-                            "4. ERROR: MISSING METADATA due to network errors. Re-try or fix manually.")
-                self.album_remove_request(album)
+                    if self.ERROR or self.INFO:
+                        write_log(release_id, 'error', "EXHAUSTED MAX RE-TRIES for XML lookup for track %s", track)
+                        self.append_tag(release_id, track.metadata, '~cwp_error',
+                                        "4. ERROR: MISSING METADATA due to network errors. Re-try or fix manually.")
+                self.album_remove_request(release_id, album)
             return
         tuples = self.works_queue.remove(workId)
+        # if self.INFO:
+        #     write_log('session', 'info', 'Found work id %s. Tuples are %r', workId, tuples)
         if tuples:
-            for track, album in tuples:
-                if self.DEBUG:
-                    log.debug("%s Requests = %s", PLUGIN_NAME, album._requests)
-            # use representative album & track
-            album = tuples[0][1]
-            track = tuples[0][0]
-            options = self.options[track]
-            if self.INFO:
-                log.info("RESPONSE = %s", response)
-            # find the id_tuple(s) key with workId in it
-            wid_list = []
-            for w in self.work_listing[album]:
-                if workId in w and w not in wid_list:
-                    wid_list.append(w)
-            if self.INFO:
-                log.info('wid_list for %s is %s', workId, wid_list)
-            if self.INFO:
-                log.info('self.parts: %s', self.parts)
-            for wid in wid_list:  # wid is a tuple
-                metaList = self.work_process_metadata(
-                    workId, wid, tuples, response)
-                parentList = metaList[0]
-                # returns [parent id, parent name] or None if no parent found
-                # not just arrangers - also composers, lyricists etc.
-                arrangers = metaList[1]
-                if wid in self.parts:
+            new_queue = []
+            prev_album = None
+            for tup_num, (track, album) in enumerate(tuples):
+                release_id = track.metadata['musicbrainz_albumid']
+                # Note that this need to be set here as the work may cover multiple albums
+                if album != prev_album:
+                    write_log(release_id, 'debug',
+                              "Work_process. FOUND WORK: %s for album %s",
+                              workId, album)
+                    write_log(release_id, 'debug', "Requests for album %s = %s", album, album._requests)
+                prev_album = album
+                if self.INFO:
+                    write_log(release_id, 'info', "RESPONSE = %s", response)
+                # find the id_tuple(s) key with workId in it
+                wid_list = []
+                for w in self.work_listing[album]:
+                    if workId in w and w not in wid_list:
+                        wid_list.append(w)
+                if self.INFO:
+                    write_log(release_id, 'info', 'wid_list for %s is %s', workId, wid_list)
+                for wid in wid_list:  # wid is a tuple
+                    write_log(release_id, 'info', 'processing workId tuple: %r', wid)
+                    metaList = self.work_process_metadata(release_id, workId, wid, track, response)
+                    parentList = metaList[0]
+                    # returns [parent id, parent name] or None if no parent found
+                    arrangers = metaList[1]
+                    # not just arrangers - also composers, lyricists etc.
+                    if wid in self.parts:
 
-                    if arrangers:
-                        if 'arrangers' in self.parts[wid]:
-                            self.parts[wid]['arrangers'] += arrangers
-                        else:
-                            self.parts[wid]['arrangers'] = arrangers
-
-                    if parentList:
-                        # first fix the sort order of multi-works at the prev
-                        # level
-                        if len(wid) > 1:
-                            for idx in wid:
-                                if idx == workId:
-                                    match_tree = [
-                                        'metadata',
-                                        'work',
-                                        'relation_list',
-                                        'attribs.target_type:work',
-                                        'relation',
-                                        'direction.text:backward',
-                                        'ordering_key',
-                                        'text']
-                                    parse_result = parse_data(
-                                        options, response, [], *match_tree)
-                                    if self.INFO:
-                                        log.info(
-                                            'multi-works - ordering key for id %s is %s', idx, parse_result)
-                                    if parse_result and parse_result[0].isdigit(
-                                    ):
-                                        key = int(parse_result[0])
-                                        self.parts[wid]['order'][idx] = key
-
-                        parentIds = parentList[0]
-                        parents = parentList[1]
-                        if self.INFO:
-                            log.info(
-                                'Parents - ids: %s, names: %s', parentIds, parents)
-                        # de-dup parent ids before we start
-                        parentIds = list(
-                            collections.OrderedDict.fromkeys(parentIds))
-                        if parentIds:
-                            if wid in self.works_cache:
-                                prev_ids = tuple(self.works_cache[wid])
-                                prev_name = self.parts[prev_ids]['name']
-                                self.works_cache[wid] = add_list_uniquely(
-                                    self.works_cache[wid], parentIds)
-                                self.parts[wid]['parent'] = add_list_uniquely(
-                                    self.parts[wid]['parent'], parentIds)
-                                index = self.work_listing[album].index(
-                                    prev_ids)
-                                new_id_list = add_list_uniquely(
-                                    list(prev_ids), parentIds)
-                                new_ids = tuple(new_id_list)
-                                self.work_listing[album][index] = new_ids
-                                self.parts[new_ids] = self.parts[prev_ids]
-                                del self.parts[prev_ids]
-                                self.parts[new_ids]['name'] = add_list_uniquely(
-                                    prev_name, parents)
-                                parentIds = new_id_list
+                        if arrangers:
+                            if 'arrangers' in self.parts[wid]:
+                                self.parts[wid]['arrangers'] += arrangers
                             else:
-                                self.works_cache[wid] = parentIds
-                                self.parts[wid]['parent'] = parentIds
-                                self.parts[tuple(parentIds)]['name'] = parents
-                                self.work_listing[album].append(
-                                    tuple(parentIds))
-                            # de-duplicate the parent names
-                            self.parts[tuple(parentIds)]['name'] = list(
-                                collections.OrderedDict.fromkeys(self.parts[tuple(parentIds)]['name']))
-                            # list(set()) won't work as need to retain
-                            # order
-                            # de-duplicate the parent ids also, otherwise they will be treated as a separate parent
-                            # in the trackback structure
-                            self.parts[wid]['parent'] = list(
-                                collections.OrderedDict.fromkeys(
-                                    self.parts[wid]['parent']))
-                            self.works_cache[wid] = list(
-                                collections.OrderedDict.fromkeys(
-                                    self.works_cache[wid]))
-                            if self.DEBUG:
-                                log.debug(
-                                    '%s: added parent ids to work_listing: %s, [Requests = %s]',
-                                    PLUGIN_NAME,
-                                    parentIds,
-                                    album._requests)
+                                self.parts[wid]['arrangers'] = arrangers
+
+                        if parentList:
+                            # first fix the sort order of multi-works at the prev
+                            # level
+                            if len(wid) > 1:
+                                for idx in wid:
+                                    if idx == workId:
+                                        match_tree = [
+                                            'metadata',
+                                            'work',
+                                            'relation_list',
+                                            'attribs.target_type:work',
+                                            'relation',
+                                            'direction.text:backward',
+                                            'ordering_key',
+                                            'text']
+                                        parse_result = parse_data(release_id, response, [], *match_tree)
+                                        if self.INFO:
+                                            write_log(release_id, 'info', 'multi-works - ordering key for id %s is %s', idx,
+                                                      parse_result)
+                                        if parse_result and parse_result[0].isdigit(
+                                        ):
+                                            key = int(parse_result[0])
+                                            self.parts[wid]['order'][idx] = key
+
+                            parentIds = parentList[0]
+                            parents = parentList[1]
                             if self.INFO:
-                                log.info(
-                                    'work_listing: %s', self.work_listing[album])
-                            # the higher-level work might already be in cache
-                            # from another album
-                            if tuple(
-                                    parentIds) in self.works_cache and self.USE_CACHE:
-                                not_in_cache = self.check_cache(
-                                    track.metadata, album, track, tuple(parentIds), [])
-                                for workId_tuple in not_in_cache:
-                                    self.work_not_in_cache(
-                                        album, track, workId_tuple)
+                                write_log(release_id, 'info', 'Parents - ids: %s, names: %s', parentIds, parents)
+                            # de-dup parent ids before we start
+                            parentIds = list(
+                                collections.OrderedDict.fromkeys(parentIds))
+                            if parentIds:
+                                if wid in self.works_cache:
+                                    # Make sure we haven't done this relationship before, perhaps for another album
+                                    if set(self.works_cache[wid]) != set(parentIds):
+                                        prev_ids = tuple(self.works_cache[wid])
+                                        prev_name = self.parts[prev_ids]['name']
+                                        self.works_cache[wid] = add_list_uniquely(
+                                            self.works_cache[wid], parentIds)
+                                        self.parts[wid]['parent'] = add_list_uniquely(
+                                            self.parts[wid]['parent'], parentIds)
+                                        index = self.work_listing[album].index(
+                                            prev_ids)
+                                        new_id_list = add_list_uniquely(
+                                            list(prev_ids), parentIds)
+                                        new_ids = tuple(new_id_list)
+                                        self.work_listing[album][index] = new_ids
+                                        self.parts[new_ids] = self.parts[prev_ids]
+                                        del self.parts[prev_ids]
+                                        self.parts[new_ids]['name'] = add_list_uniquely(
+                                            prev_name, parents)
+                                        parentIds = new_id_list
+                                else:
+                                    self.works_cache[wid] = parentIds
+                                    self.parts[wid]['parent'] = parentIds
+                                    self.parts[tuple(parentIds)]['name'] = parents
+                                    self.work_listing[album].append(
+                                        tuple(parentIds))
+                                # de-duplicate the parent names
+                                self.parts[tuple(parentIds)]['name'] = list(
+                                    collections.OrderedDict.fromkeys(self.parts[tuple(parentIds)]['name']))
+                                # list(set()) won't work as need to retain
+                                # order
+                                # de-duplicate the parent ids also, otherwise they will be treated as a separate parent
+                                # in the trackback structure
+                                self.parts[wid]['parent'] = list(
+                                    collections.OrderedDict.fromkeys(
+                                        self.parts[wid]['parent']))
+                                self.works_cache[wid] = list(
+                                    collections.OrderedDict.fromkeys(
+                                        self.works_cache[wid]))
+                                if self.INFO:
+                                    write_log(release_id, 'info',
+                                              'Added parent ids to work_listing: %s, [Requests = %s]',
+                                              parentIds, album._requests)
+                                if self.INFO:
+                                    write_log(release_id, 'info', 'work_listing after adding parents: %s',
+                                              self.work_listing[album])
+                                # the higher-level work might already be in cache
+                                # from another album
+                                if tuple(
+                                        parentIds) in self.works_cache and self.USE_CACHE:
+                                    not_in_cache = self.check_cache(
+                                        track.metadata, album, track, tuple(parentIds), [])
+                                    for workId_tuple in not_in_cache:
+                                        new_queue.append((release_id, album, track, workId_tuple))
+
+                                else:
+                                    if not self.USE_CACHE:
+                                        if tuple(parentIds) in self.works_cache:
+                                            del self.works_cache[tuple(parentIds)]
+                                    for parentId in parentIds:
+                                        new_queue.append((release_id, album, track, (parentId,)))
+
                             else:
-                                if not self.USE_CACHE:
-                                    if tuple(parentIds) in self.works_cache:
-                                        del self.works_cache[tuple(parentIds)]
-                                for parentId in parentIds:
-                                    for track, album in tuples:
-                                        self.work_add_track(
-                                            album, track, parentId, 0)
+                                # so we remember we looked it up and found none
+                                self.parts[wid]['no_parent'] = True
+                                self.top_works[(track, album)]['workId'] = wid
+                                if wid not in self.top[album]:
+                                    self.top[album].append(wid)
+                                if self.INFO:
+                                    write_log(release_id, 'info', "TOP[album]: %s", self.top[album])
                         else:
                             # so we remember we looked it up and found none
                             self.parts[wid]['no_parent'] = True
                             self.top_works[(track, album)]['workId'] = wid
-                            if wid not in self.top[album]:
-                                self.top[album].append(wid)
-                            if self.INFO:
-                                log.info("TOP[album]: %s", self.top[album])
-                    else:
-                        # so we remember we looked it up and found none
-                        self.parts[wid]['no_parent'] = True
-                        self.top_works[(track, album)]['workId'] = wid
-                        self.top[album].append(wid)
-        for track, album in tuples:
-            if album._requests == 1:  # Next remove will finalise album
-                # so do the final album-level processing before we go!
-                self.process_album(album)
-            self.album_remove_request(album)
-            if self.DEBUG:
-                log.debug(
-                    "%s: Removed request. Requests = %s",
-                    PLUGIN_NAME,
-                    album._requests)
-        if self.DEBUG:
-            log.debug(
-                "%s: End of work_process for workid %s",
-                PLUGIN_NAME,
-                workId)
+                            self.top[album].append(wid)
 
-    def work_process_metadata(self, workId, wid, tuples, response):
+                if self.DEBUG or self.INFO:
+                    write_log(release_id, 'debug', "End of tuple processing for workid %s in album %s, track %s,"
+                                                   " requests remaining  = %s, new queue is %r",
+                              workId, album, track, album._requests, new_queue)
+                self.album_remove_request(release_id, album)
+                for queued_item in new_queue:
+                    if self.INFO:
+                        write_log(release_id, 'info', 'Have a new queue: queued_item = %r', queued_item)
+            write_log(release_id, 'debug',
+                      'Penultimate end of work_process for %s (subject to parent lookups in "new_queue")', workId)
+            for queued_item in new_queue:
+                self.work_not_in_cache(queued_item[0], queued_item[1], queued_item[2], queued_item[3])
+            write_log(release_id, 'debug',
+                      'Ultimate end of work_process for %s', workId)
+            if album._requests == 0:
+                self.process_album(release_id, album)
+                album._finalize_loading(None)
+                close_log(release_id, 'works')
+
+
+
+
+
+    def work_process_metadata(self, release_id, workId, wid, track, response):
         """
         Process XML node
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
+        NB release_id may be from a different album than the original, if works lookups are identical
         :param workId:
         :param wid:
         :param tuples:
         :param response:
         :return:
         """
-        if self.DEBUG:
-            log.debug("%s: In work_process_metadata", PLUGIN_NAME)
-        log_options = {'log_debug': self.DEBUG, 'log_info': self.INFO}
-        options = config.setting
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "In work_process_metadata")
         if 'metadata' in response.children:
             if 'work' in response.metadata[0].children:
-                work_genres = []
-                all_tags = parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'tag_list',
-                    'tag',
-                    'name',
-                    'text')
-                if options['cwp_genres_use_folks']:
-                    work_genres = all_tags
-                if options['cwp_genres_use_worktype']:
-                    work_type = parse_data(
-                        log_options,
-                        response.metadata[0].work,
-                        [],
-                        'attribs.type')
-                    work_genres += work_type
-                if 'genres' in self.parts[wid]:
-                    self.parts[wid]['genres'] += work_genres
-                else:
-                    self.parts[wid]['genres'] = work_genres
-                key = parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'attribute_list',
-                    'attribute',
-                    'attribs.type:Key',
-                    'text')
-                if 'key' in self.parts[wid]:
-                    self.parts[wid]['key'] += key
-                else:
-                    self.parts[wid]['key'] = key
-                composed_begin_dates = year(parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'relation_list',
-                    'attribs.target_type:artist',
-                    'relation',
-                    'attribs.type:composer',
-                    'begin',
-                    'text'))
-                composed_end_dates = year(parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'relation_list',
-                    'attribs.target_type:artist',
-                    'relation',
-                    'attribs.type:composer',
-                    'end',
-                    'text'))
+                all_tags = parse_data(release_id, response.metadata[0].work, [], 'tag_list', 'tag', 'name', 'text')
+                self.parts[wid]['folks_genres'] = all_tags
+                self.parts[wid]['worktype_genres'] = parse_data(release_id, response.metadata[0].work, [], 'attribs.type')
+                key = parse_data(release_id, response.metadata[0].work, [], 'attribute_list', 'attribute',
+                                 'attribs.type:Key', 'text')
+                self.parts[wid]['key'] = key
+                composed_begin_dates = year(
+                    parse_data(release_id, response.metadata[0].work, [], 'relation_list', 'attribs.target_type:artist',
+                               'relation', 'attribs.type:composer', 'begin', 'text'))
+                composed_end_dates = year(
+                    parse_data(release_id, response.metadata[0].work, [], 'relation_list', 'attribs.target_type:artist',
+                               'relation', 'attribs.type:composer', 'end', 'text'))
                 if composed_begin_dates == composed_end_dates:
                     composed_dates = composed_begin_dates
                 else:
                     composed_dates = zip(composed_begin_dates, composed_end_dates)
                     composed_dates = [y + DATE_SEP + z for y, z in composed_dates]
-                if 'composed_dates' in self.parts[wid]:
-                    self.parts[wid]['composed_dates'] += composed_dates
-                else:
-                    self.parts[wid]['composed_dates'] = composed_dates
-                published_begin_dates = year(parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'relation_list',
-                    'attribs.target_type:label',
-                    'relation',
-                    'attribs.type:publishing',
-                    'begin',
-                    'text'))
-                published_end_dates = year(parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'relation_list',
-                    'attribs.target_type:label',
-                    'relation',
-                    'attribs.type:publishing',
-                    'end',
-                    'text'))
+                self.parts[wid]['composed_dates'] = composed_dates
+                published_begin_dates = year(
+                    parse_data(release_id, response.metadata[0].work, [], 'relation_list', 'attribs.target_type:label',
+                               'relation', 'attribs.type:publishing', 'begin', 'text'))
+                published_end_dates = year(
+                    parse_data(release_id, response.metadata[0].work, [], 'relation_list', 'attribs.target_type:label',
+                               'relation', 'attribs.type:publishing', 'end', 'text'))
                 if published_begin_dates == published_end_dates:
                     published_dates = published_begin_dates
                 else:
                     published_dates = zip(published_begin_dates, published_end_dates)
                     published_dates = [x + DATE_SEP + y for x, y in published_dates]
-                if 'published_dates' in self.parts[wid]:
-                    self.parts[wid]['published_dates'] += published_dates
-                else:
-                    self.parts[wid]['published_dates'] = published_dates
+                self.parts[wid]['published_dates'] = published_dates
 
-                premiered_begin_dates = year(parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'relation_list',
-                    'attribs.target_type:place',
-                    'relation',
-                    'attribs.type:premiere',
-                    'begin',
-                    'text'))
-                premiered_end_dates = year(parse_data(
-                    log_options,
-                    response.metadata[0].work,
-                    [],
-                    'relation_list',
-                    'attribs.target_type:place',
-                    'relation',
-                    'attribs.type:premiere',
-                    'end',
-                    'text'))
+                premiered_begin_dates = year(
+                    parse_data(release_id, response.metadata[0].work, [], 'relation_list', 'attribs.target_type:place',
+                               'relation', 'attribs.type:premiere', 'begin', 'text'))
+                premiered_end_dates = year(
+                    parse_data(release_id, response.metadata[0].work, [], 'relation_list', 'attribs.target_type:place',
+                               'relation', 'attribs.type:premiere', 'end', 'text'))
                 if premiered_begin_dates == premiered_end_dates:
                     premiered_dates = premiered_begin_dates
                 else:
                     premiered_dates = zip(premiered_begin_dates, premiered_end_dates)
                     premiered_dates = [x + DATE_SEP + y for x, y in premiered_dates]
-                if 'premiered_dates' in self.parts[wid]:
-                    self.parts[wid]['premiered_dates'] += premiered_dates
-                else:
-                    self.parts[wid]['premiered_dates'] = premiered_dates
+                self.parts[wid]['premiered_dates'] = premiered_dates
 
-                if options['cwp_workdate_include']:
-                    if options['cwp_workdate_source_composed'] and 'composed_dates' in self.parts[wid]:
-                        workdates = self.parts[wid]['composed_dates']
-                    elif options['cwp_workdate_source_published'] and 'published_dates' in self.parts[wid]:
-                        workdates = self.parts[wid]['published_dates']
-                    elif options['cwp_workdate_source_premiered'] and 'premiered_dates' in self.parts[wid]:
-                        workdates = self.parts[wid]['premiered_dates']
-                    else:
-                        workdates = []
-                else:
-                    workdates = []
-                if options['cwp_key_include']:
-                    keys = self.parts[wid]['key']
-                else:
-                    keys = []
-                annotations = keys + workdates
-                if annotations:
-                    if self.parts[wid]['annotations']:
-                        self.parts[wid]['annotations'] += annotations
-                    else:
-                        self.parts[wid]['annotations'] = annotations
+
 
 
                 if 'artist_locale' in config.setting:
                     locale = config.setting["artist_locale"]
                     # NB this is the Picard code in /util
                     lang = locale.split("_")[0]
-                    alias = parse_data(
-                        log_options,
-                        response.metadata[0].work,
-                        [],
-                        'alias_list',
-                        'alias',
-                        'attribs.locale:' + lang,
-                        'attribs.primary:primary',
-                        'text')
-                    user_tags = parse_data(
-                        log_options,
-                        response.metadata[0].work,
-                        [],
-                        'user_tag_list',
-                        'user_tag',
-                        'name',
-                        'text')
+                    alias = parse_data(release_id, response.metadata[0].work, [], 'alias_list', 'alias',
+                                       'attribs.locale:' + lang, 'attribs.primary:primary', 'text')
+                    user_tags = parse_data(release_id, response.metadata[0].work, [], 'user_tag_list', 'user_tag',
+                                           'name', 'text')
                     if config.setting['cwp_aliases_tags_user']:
                         tags = user_tags
                     else:
@@ -4987,192 +4916,140 @@ class PartLevels():
                                 # alias should be a one item list but...
                                 self.parts[wid]['alias'][ind] = '; '.join(
                                     alias)
-                relation_list = parse_data(
-                    log_options, response.metadata[0].work, [], 'relation_list')
-                rep_track = None
-                for track, _ in tuples:
-                    rep_track = track  # Representative track for option ident only,
-                    # otherwise rep_track = None will yield Picard.ini settings
-                return self.work_process_relations(
-                    rep_track, workId, wid, relation_list)
+                relation_list = parse_data(release_id, response.metadata[0].work, [], 'relation_list')
+                return self.work_process_relations(release_id, track, workId, wid, relation_list)
 
             else:
-                if self.ERROR:
-                    log.error(
-                        "%s: %r: MusicBrainz work xml result not in correct format - %s",
-                        PLUGIN_NAME,
-                        workId,
-                        response)
-                for track, _ in tuples:  # album not currently used
-                    tm = track.metadata
-                    self.append_tag(
-                        tm,
-                        '~cwp_error',
-                        '5. MusicBrainz work xml result not in correct format for work id: ' +
-                        unicode(workId))
+                if self.ERROR or self.INFO:
+                    write_log(release_id, 'error', "%r: MusicBrainz work xml result not in correct format - %s",
+                              workId, response)
+                tm = track.metadata
+                self.append_tag(release_id, tm, '~cwp_error',
+                                '5. MusicBrainz work xml result not in correct format for work id: ' +
+                                unicode(workId))
         return None
 
-    def work_process_relations(self, track, workId, wid, relations):
+    def work_process_relations(self, release_id, track, workId, wid, relations):
         """
         Find the parents etc.
+        NB track is just the last album/track for this work - used as being
+        representative for options identification. If this is inconsistent (e.g. different collections
+        option for albums with the same works) then the latest added track will over-ride others' settings).
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param track:
         :param workId:
         :param wid:
         :param relations:
         :return:
         """
-        # nb track is just the last track for this work - used as being
-        # representative for options identification
-        if self.DEBUG:
-            log.debug(
-                "%s In work_process_relations. Relations--> %s",
-                PLUGIN_NAME,
-                relations)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "In work_process_relations. Relations--> %s", relations)
         if track:
             options = self.options[track]
         else:
             options = config.setting
-        log_options = {'log_debug': self.DEBUG, 'log_info': self.INFO}
         new_workIds = []
         new_works = []
-
-        relation_attribute = parse_data(
-            log_options,
-            relations,
-            [],
-            'attribs.target_type:work',
-            'relation',
-            'attribs.type:parts',
-            'direction.text:backward',
-            'attribute_list',
-            'attribute',
-            'text')
+        relation_attribute = parse_data(release_id, relations, [], 'attribs.target_type:work', 'relation',
+                                        'attribs.type:parts', 'direction.text:backward', 'attribute_list', 'attribute',
+                                        'text')
         if 'part of collection' not in relation_attribute or options['cwp_collections']:
-            new_work_list = parse_data(
-                log_options,
-                relations,
-                [],
-                'attribs.target_type:work',
-                'relation',
-                'attribs.type:parts',
-                'direction.text:backward',
-                'work')
+            new_work_list = parse_data(release_id, relations, [], 'attribs.target_type:work', 'relation',
+                                       'attribs.type:parts', 'direction.text:backward', 'work')
         else:
             new_work_list = []
         if new_work_list:
-            new_workIds = parse_data(
-                log_options, new_work_list, [], 'attribs', 'id')
-            new_works = parse_data(
-                log_options, new_work_list, [], 'title', 'text')
+            new_workIds = parse_data(release_id, new_work_list, [], 'attribs', 'id')
+            new_works = parse_data(release_id, new_work_list, [], 'title', 'text')
         else:
-            arrangement_of = parse_data(
-                log_options,
-                relations,
-                [],
-                'attribs.target_type:work',
-                'relation',
-                'attribs.type:arrangement',
-                'direction.text:backward',
-                'work')
+            arrangement_of = parse_data(release_id, relations, [], 'attribs.target_type:work', 'relation',
+                                        'attribs.type:arrangement', 'direction.text:backward', 'work')
             if arrangement_of and options['cwp_arrangements']:
-                new_workIds = parse_data(
-                    log_options, arrangement_of, [], 'attribs', 'id')
-                new_works = parse_data(
-                    log_options, arrangement_of, [], 'title', 'text')
+                new_workIds = parse_data(release_id, arrangement_of, [], 'attribs', 'id')
+                new_works = parse_data(release_id, arrangement_of, [], 'title', 'text')
                 self.parts[wid]['arrangement'] = True
             else:
-                medley_of = parse_data(
-                    log_options,
-                    relations,
-                    [],
-                    'attribs.target_type:work',
-                    'relation',
-                    'attribs.type:medley',
-                    'work')
-                direction = parse_data(
-                    log_options,
-                    relations,
-                    [],
-                    'attribs.target_type:work',
-                    'relation',
-                    'attribs.type:medley',
-                    'direction',
-                    'text')
+                medley_of = parse_data(release_id, relations, [], 'attribs.target_type:work', 'relation',
+                                       'attribs.type:medley', 'work')
+                direction = parse_data(release_id, relations, [], 'attribs.target_type:work', 'relation',
+                                       'attribs.type:medley', 'direction', 'text')
                 if 'backward' not in direction:
-                    if self.DEBUG:
-                        log.debug('%s: medley_of: %s', PLUGIN_NAME, medley_of)
+                    if self.INFO:
+                        write_log(release_id, 'info', 'Medley_of: %s', medley_of)
                     if medley_of and options['cwp_medley']:
                         medley_list = []
                         for medley_item in medley_of:
                             medley_list = medley_list + \
-                                parse_data(log_options, medley_item, [], 'title', 'text')
+                                          parse_data(release_id, medley_item, [], 'title', 'text')
                             # (parse_data is a list...)
                             if self.INFO:
-                                log.info('medley_list: %s', medley_list)
+                                write_log(release_id, 'info', 'Medley_list: %s', medley_list)
                         self.parts[wid]['medley_list'] = medley_list
 
         if self.INFO:
-            log.info('New works: ids: %s, names: %s', new_workIds, new_works)
+            write_log(release_id, 'info', 'New works: ids: %s, names: %s', new_workIds, new_works)
 
-        artists = get_artists(options, {}, relations, 'work')['artists']
+        artists = get_artists(options, release_id, {}, relations, 'work')['artists']
         # artist_types = ['arranger', 'instrument arranger', 'orchestrator', 'composer', 'writer', 'lyricist',
         #                 'librettist', 'revised by', 'translator', 'reconstructed by', 'vocal arranger']
 
         if self.INFO:
-            log.info("ARTISTS %s", artists)
+            write_log(release_id, 'info', "ARTISTS %s", artists)
 
         workItems = (new_workIds, new_works)
         itemsFound = [workItems, artists]
         return itemsFound
 
-    def album_add_request(self, album):
+    def album_add_request(self, release_id, album):
         """
         To keep track as to whether all lookups have been processed
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :return:
         """
         album._requests += 1
-        if self.INFO:
-            log.info("album requests: %s", album._requests)
+        write_log(release_id, 'debug', "Added album request - requests: %s", album._requests)
 
-    def album_remove_request(self, album):
+    def album_remove_request(self, release_id, album):
         """
         To keep track as to whether all lookups have been processed
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :return:
         """
         album._requests -= 1
-        if self.INFO:
-            log.info("album requests: %s", album._requests)
-        album._finalize_loading(None)
+        write_log(release_id, 'debug', "Removed album request - requests: %s", album._requests)
 
     ##################################################
-    # SECTION 2 - Organise tracks and works in album #
+    # SECTION 3 - Organise tracks and works in album #
     ##################################################
 
-    def process_album(self, album):
+    def process_album(self, release_id, album):
         """
         Top routine to run end-of-album processes
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :return:
         """
-        if self.DEBUG:
-            log.debug("%s: PROCESS ALBUM %s", PLUGIN_NAME, album)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "PROCESS ALBUM %s", album)
         # populate the inverse hierarchy
         if self.INFO:
-            log.info("%s: Cache: %s", PLUGIN_NAME, self.works_cache)
+            write_log(release_id, 'info', "Cache: %s", self.works_cache)
         if self.INFO:
-            log.info("%s: Work listing %s", PLUGIN_NAME, self.work_listing)
+            write_log(release_id, 'info', "Work listing %s", self.work_listing)
         alias_tag_list = config.setting['cwp_aliases_tag_text'].split(',')
         for i, tag_item in enumerate(alias_tag_list):
             alias_tag_list[i] = tag_item.strip()
         for workId in self.work_listing[album]:
             if workId in self.parts:
                 if self.INFO:
-                    log.info('Processing workid: %s', workId)
-                    log.info(
-                        'self.work_listing[album]: %s',
-                        self.work_listing[album])
+                    write_log(release_id, 'info', 'Processing workid: %s', workId)
+                    write_log(release_id, 'info', 'self.work_listing[album]: %s', self.work_listing[album])
                 if len(workId) > 1:
                     # fix the order of names using ordering keys gathered in
                     # work_process
@@ -5201,23 +5078,19 @@ class PartLevels():
                             self.parts[workId]['name'] = self.parts[workId]['alias'][:]
                 topId = None
                 if self.INFO:
-                    log.info('Works_cache: %s', self.works_cache)
+                    write_log(release_id, 'info', 'Works_cache: %s', self.works_cache)
                 if workId in self.works_cache:
                     parentIds = tuple(self.works_cache[workId])
                     # for parentId in parentIds:
-                    if self.DEBUG:
-                        log.debug("%s: create inverses: %s, %s",
-                                  PLUGIN_NAME, workId, parentIds)
+                    if self.DEBUG or self.INFO:
+                        write_log(release_id, 'debug', "Create inverses: %s, %s", workId, parentIds)
                     if parentIds in self.partof[album]:
                         if workId not in self.partof[album][parentIds]:
                             self.partof[album][parentIds].append(workId)
                     else:
                         self.partof[album][parentIds] = [workId]
-                    if self.DEBUG:
-                        log.debug(
-                            "%s: Partof: %s",
-                            PLUGIN_NAME,
-                            self.partof[album][parentIds])
+                    if self.INFO:
+                        write_log(release_id, 'info', "Partof: %s", self.partof[album][parentIds])
                     if 'no_parent' in self.parts[parentIds]:
                         # to handle case if album includes works already in
                         # cache from a different album
@@ -5234,42 +5107,26 @@ class PartLevels():
         # work out the full hierarchy and part levels
         height = 0
         if self.INFO:
-            log.info(
-                "%s: TOP: %s, \nALBUM: %s, \nTOP[ALBUM]: %s",
-                PLUGIN_NAME,
-                self.top,
-                album,
-                self.top[album])
+            write_log(release_id, 'info', "TOP: %s, \nALBUM: %s, \nTOP[ALBUM]: %s", self.top, album,
+                      self.top[album])
         if len(self.top[album]) > 1:
             single_work_album = 0
         else:
             single_work_album = 1
         for topId in self.top[album]:
-            self.create_trackback(album, topId)
+            self.create_trackback(release_id, album, topId)
             if self.INFO:
-                log.info(
-                    "Top id = %s, Name = %s",
-                    topId,
-                    self.parts[topId]['name'])
+                write_log(release_id, 'info', "Top id = %s, Name = %s", topId, self.parts[topId]['name'])
 
             if self.INFO:
-                log.info(
-                    "Trackback before levels: %s",
-                    self.trackback[album][topId])
+                write_log(release_id, 'info', "Trackback before levels: %s", self.trackback[album][topId])
             if self.INFO:
-                log.info(
-                    "Trackback before levels: %s",
-                    self.trackback[album][topId])
-            work_part_levels = self.level_calc(
-                self.trackback[album][topId], height)
+                write_log(release_id, 'info', "Trackback before levels: %s", self.trackback[album][topId])
+            work_part_levels = self.level_calc(release_id, self.trackback[album][topId], height)
             if self.INFO:
-                log.info(
-                    "Trackback after levels: %s",
-                    self.trackback[album][topId])
+                write_log(release_id, 'info', "Trackback after levels: %s", self.trackback[album][topId])
             if self.INFO:
-                log.info(
-                    "Trackback after levels: %s",
-                    self.trackback[album][topId])
+                write_log(release_id, 'info', "Trackback after levels: %s", self.trackback[album][topId])
             # determine the level which will be the principal 'work' level
             if work_part_levels >= 3:
                 ref_level = work_part_levels - single_work_album
@@ -5284,12 +5141,11 @@ class PartLevels():
                 'name': self.parts[topId]['name'],
                 'single': single_work_album}
             # set the metadata in sequence defined by the work structure
-            answer = self.process_trackback(
-                album, self.trackback[album][topId], ref_height, top_info)
+            answer = self.process_trackback(release_id, album, self.trackback[album][topId], ref_height, top_info)
             if answer:
                 tracks = answer[1]['track']
                 if self.INFO:
-                    log.info("TRACKS: %s", tracks)
+                    write_log(release_id, 'info', "TRACKS: %s", tracks)
                 # work_part_levels = self.trackback[album][topId]['depth']
                 for track in tracks:
                     track_meta = track[0]
@@ -5298,113 +5154,110 @@ class PartLevels():
                         workIds = interpret(tm['~cwp_workid_0'])
                         if workIds:
                             count = 0
-                            self.process_work_artists(
-                                album, track_meta, workIds, tm, count)
+                            self.process_work_artists(release_id, album, track_meta, workIds, tm, count)
                     title_work_levels = 0
                     if '~cwp_title_work_levels' in tm:
                         title_work_levels = int(tm['~cwp_title_work_levels'])
-                    self.extend_metadata(
-                        top_info,
-                        track_meta,
-                        ref_height,
-                        title_work_levels)  # revise for new data
+                    self.extend_metadata(release_id, top_info, track_meta, ref_height,
+                                         title_work_levels)  # revise for new data
                     if track_meta not in self.tracks[album]:
                         self.tracks[album].append(track_meta)
-                if self.DEBUG:
-                    log.debug(
-                        "%s FINISHED TRACK PROCESSING FOR Top work id: %s",
-                        PLUGIN_NAME,
-                        topId)
+                if self.DEBUG or self.INFO:
+                    write_log(release_id, 'debug', "FINISHED TRACK PROCESSING FOR Top work id: %s", topId)
         # Need to redo the loop so that all album-wide tm is updated before
         # publishing
         for track in self.tracks[album]:
-            self.publish_metadata(album, track)
-        if self.INFO:
-            log.info('Self.parts: %s', self.parts)
-        if self.INFO:
-            log.info('Self.trackback: %s', self.trackback)
+            self.publish_metadata(release_id, album, track)
+        """
+        The messages below are normally commented out as they get VERY long if there are a lot of albums loaded
+        For extreme debugging, remove the comments and just run one or a few albums
+        Do not forget to comment out again.
+        """
+        # if self.INFO:
+        #     write_log(release_id, 'info', 'Self.parts: %s', self.parts)
+        # if self.INFO:
+        #     write_log(release_id, 'info', 'Self.trackback: %s', self.trackback)
+
         # tidy up
         self.trackback[album].clear()
         # Finally process the orphan tracks
         if album in self.orphan_tracks:
             for track in self.orphan_tracks[album]:
-                self.publish_metadata(album, track)
+                self.publish_metadata(release_id, album, track)
+        write_log(release_id, 'debug', "PROCESS ALBUM function complete")
 
-    def create_trackback(self, album, parentId):
+    def create_trackback(self, release_id, album, parentId):
         """
         Create an inverse listing of the work-parent relationships
+        :param release_id:
         :param album:
         :param parentId:
         :return: trackback for a given parentId
         """
-        if self.DEBUG:
-            log.debug("%s: Create trackback for %s", PLUGIN_NAME, parentId)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Create trackback for %s", parentId)
         if parentId in self.partof[album]:  # NB parentId is a tuple
             for child in self.partof[album][parentId]:  # NB child is a tuple
                 if child in self.partof[album]:
-                    child_trackback = self.create_trackback(album, child)
-                    self.append_trackback(album, parentId, child_trackback)
+                    child_trackback = self.create_trackback(release_id, album, child)
+                    self.append_trackback(release_id, album, parentId, child_trackback)
                 else:
-                    self.append_trackback(
-                        album, parentId, self.trackback[album][child])
+                    self.append_trackback(release_id, album, parentId, self.trackback[album][child])
             return self.trackback[album][parentId]
         else:
             return self.trackback[album][parentId]
 
-    def append_trackback(self, album, parentId, child):
+    def append_trackback(self, release_id, album, parentId, child):
         """
         Recursive process to populate trackback
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :param parentId:
         :param child:
         :return:
         """
-        if self.DEBUG:
-            log.debug("In append_trackback...")
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "In append_trackback...")
         if parentId in self.trackback[album]:  # NB parentId is a tuple
             if 'children' in self.trackback[album][parentId]:
                 if child not in self.trackback[album][parentId]['children']:
-                    if self.DEBUG:
-                        log.debug("TRYING TO APPEND...")
+                    if self.INFO:
+                        write_log(release_id, 'info', "TRYING TO APPEND...")
                     self.trackback[album][parentId]['children'].append(child)
-                    if self.DEBUG:
-                        log.debug("...PARENT %s - ADDED %s as child",
-                                  self.parts[parentId]['name'], child)
+                    if self.INFO:
+                        write_log(release_id, 'info', "...PARENT %s - ADDED %s as child", self.parts[parentId]['name'],
+                                  child)
                 else:
-                    if self.DEBUG:
-                        log.debug(
-                            "Parent %s already has %s as child", parentId, child)
+                    if self.INFO:
+                        write_log(release_id, 'info', "Parent %s already has %s as child", parentId, child)
             else:
                 self.trackback[album][parentId]['children'] = [child]
-                if self.DEBUG:
-                    log.debug(
-                        "Existing PARENT %s - ADDED %s as child",
-                        self.parts[parentId]['name'],
-                        child)
+                if self.INFO:
+                    write_log(release_id, 'info', "Existing PARENT %s - ADDED %s as child",
+                              self.parts[parentId]['name'], child)
         else:
             self.trackback[album][parentId]['id'] = parentId
             self.trackback[album][parentId]['children'] = [child]
-            if self.DEBUG:
-                log.debug("New PARENT %s - ADDED %s as child",
-                          self.parts[parentId]['name'], child)
             if self.INFO:
-                log.info(
-                    "APPENDED TRACKBACK: %s",
-                    self.trackback[album][parentId])
+                write_log(release_id, 'info', "New PARENT %s - ADDED %s as child", self.parts[parentId]['name'], child)
+                write_log(release_id, 'info', "APPENDED TRACKBACK: %s", self.trackback[album][parentId])
         return self.trackback[album][parentId]
 
-    def level_calc(self, trackback, height):
+    def level_calc(self, release_id, trackback, height):
         """
         Recursive process to determine the max level for a work
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param trackback:
         :param height: number of levels above this one
         :return:
         """
-        if self.DEBUG:
-            log.debug('%s: In level_calc process', PLUGIN_NAME)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', 'In level_calc process')
         if 'children' not in trackback:
             if self.INFO:
-                log.info("Got to bottom")
+                write_log(release_id, 'info', "Got to bottom")
             trackback['height'] = height
             trackback['depth'] = 0
             return 0
@@ -5414,32 +5267,31 @@ class PartLevels():
             max_depth = 0
             for child in trackback['children']:
                 if self.INFO:
-                    log.info("CHILD: %s", child)
-                depth = self.level_calc(child, height) + 1
+                    write_log(release_id, 'info', "CHILD: %s", child)
+                depth = self.level_calc(release_id, child, height) + 1
                 if self.INFO:
-                    log.info("DEPTH: %s", depth)
+                    write_log(release_id, 'info', "DEPTH: %s", depth)
                 max_depth = max(depth, max_depth)
             trackback['depth'] = max_depth
             return max_depth
 
         ###########################################
-        # SECTION 3 - Process tracks within album #
+        # SECTION 4 - Process tracks within album #
         ###########################################
 
-    def process_trackback(self, album_req, trackback, ref_height, top_info):
+    def process_trackback(self, release_id, album_req, trackback, ref_height, top_info):
         """
         Set work structure metadata & govern other metadata-setting processes
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album_req:
         :param trackback:
         :param ref_height:
         :param top_info:
         :return:
         """
-        if self.DEBUG:
-            log.debug(
-                "%s: IN PROCESS_TRACKBACK. Trackback = %s",
-                PLUGIN_NAME,
-                trackback)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "IN PROCESS_TRACKBACK. Trackback = %s", trackback)
         tracks = collections.defaultdict(dict)
         process_now = False
         if 'meta' in trackback:
@@ -5448,34 +5300,34 @@ class PartLevels():
                     process_now = True
         if process_now or 'children' not in trackback:
             if 'meta' in trackback and 'id' in trackback and 'depth' in trackback and 'height' in trackback:
-                if self.DEBUG:
-                    log.debug("Processing level 0")
+                if self.INFO:
+                    write_log(release_id, 'info', "Processing level 0")
                 depth = trackback['depth']
                 height = trackback['height']
                 workId = tuple(trackback['id'])
                 if depth != 0:
                     if 'children' in trackback:
-                        child_response = self.process_trackback_children(
-                            album_req, trackback, ref_height, top_info, tracks)
+                        child_response = self.process_trackback_children(release_id, album_req, trackback, ref_height,
+                                                                         top_info, tracks)
                         tracks = child_response[1]
-                    if self.DEBUG:
-                        log.debug(
-                            '%s: Bottom level for this trackback is higher level elsewhere - adjusting levels',
-                            PLUGIN_NAME)
+                    if self.INFO:
+                        write_log(release_id, 'info',
+                                  'Bottom level for this trackback is higher level elsewhere - adjusting levels')
                     depth = 0
                 if self.INFO:
-                    log.info("WorkId %s", workId)
+                    write_log(release_id, 'info', "WorkId %s", workId)
                 if self.INFO:
-                    log.info("Work name %s", self.parts[workId]['name'])
+                    write_log(release_id, 'info', "Work name %s", self.parts[workId]['name'])
                 for track, album in trackback['meta']:
                     if album == album_req:
                         if self.INFO:
-                            log.info("Track: %s", track)
+                            write_log(release_id, 'info', "Track: %s", track)
                         tm = track.metadata
                         if self.INFO:
-                            log.info("Track metadata = %s", tm)
+                            write_log(release_id, 'info', "Track metadata = %s", tm)
                         tm['~cwp_workid_' + unicode(depth)] = workId
-                        self.write_tags(tm, workId, unicode(depth))
+                        self.write_tags(release_id, track, tm, workId)
+                        self.make_annotations(release_id, track, workId)
                         # strip leading and trailing spaces from work names
                         if isinstance(self.parts[workId]['name'], basestring):
                             worktemp = self.parts[workId]['name'].strip()
@@ -5497,40 +5349,30 @@ class PartLevels():
                         tm['~cwp_work_top'] = toptemp
                         tm['~cwp_single_work_album'] = top_info['single']
                         if self.INFO:
-                            log.info("Track metadata = %s", tm)
+                            write_log(release_id, 'info', "Track metadata = %s", tm)
                         if 'track' in tracks:
                             tracks['track'].append((track, height))
                         else:
                             tracks['track'] = [(track, height)]
                         if self.INFO:
-                            log.info("Tracks: %s", tracks)
+                            write_log(release_id, 'info', "Tracks: %s", tracks)
 
                 response = (workId, tracks)
-                if self.DEBUG:
-                    log.debug("%s: LEAVING PROCESS_TRACKBACK", PLUGIN_NAME)
+                if self.DEBUG or self.INFO:
+                    write_log(release_id, 'debug', "LEAVING PROCESS_TRACKBACK")
                 if self.INFO:
-                    log.info("depth %s Response = %s", depth, response)
+                    write_log(release_id, 'info', "depth %s Response = %s", depth, response)
                 return response
             else:
                 return None
         else:
-            response = self.process_trackback_children(
-                album_req, trackback, ref_height, top_info, tracks)
+            response = self.process_trackback_children(release_id, album_req, trackback, ref_height, top_info, tracks)
             return response
 
-    def process_trackback_children(
-            self,
-            album_req,
-            trackback,
-            ref_height,
-            top_info,
-            tracks):
+    def process_trackback_children(self, release_id, album_req, trackback, ref_height, top_info, tracks):
         if 'id' in trackback and 'depth' in trackback and 'height' in trackback:
-            if self.DEBUG:
-                log.debug(
-                    '%s: In process_children_trackback for trackback %s',
-                    PLUGIN_NAME,
-                    trackback)
+            if self.DEBUG or self.INFO:
+                write_log(release_id, 'debug', 'In process_children_trackback for trackback %s', trackback)
             depth = trackback['depth']
             height = trackback['height']
             parentId = tuple(trackback['id'])
@@ -5539,9 +5381,8 @@ class PartLevels():
             for child in trackback['children']:
                 width += 1
                 if self.INFO:
-                    log.info("child trackback = %s", child)
-                answer = self.process_trackback(
-                    album_req, child, ref_height, top_info)
+                    write_log(release_id, 'info', "child trackback = %s", child)
+                answer = self.process_trackback(release_id, album_req, child, ref_height, top_info)
                 if answer:
                     workId = answer[0]
                     child_tracks = answer[1]['track']
@@ -5549,17 +5390,10 @@ class PartLevels():
                         track_meta = track[0]
                         track_height = track[1]
                         part_level = track_height - height
-                        if self.DEBUG:
-                            log.debug(
-                                "%s: Calling set metadata %s",
-                                PLUGIN_NAME,
-                                (part_level,
-                                 workId,
-                                 parentId,
-                                 parent,
-                                 track_meta))
-                        self.set_metadata(
-                            part_level, workId, parentId, parent, track_meta)
+                        if self.DEBUG or self.INFO:
+                            write_log(release_id, 'debug', "Calling set metadata %s", (part_level, workId,
+                                                                                       parentId, parent, track_meta))
+                        self.set_metadata(release_id, part_level, workId, parentId, parent, track_meta)
                         if 'track' in tracks:
                             tracks['track'].append(
                                 (track_meta, track_height))
@@ -5568,8 +5402,6 @@ class PartLevels():
                         tm = track_meta.metadata
                         # ~cwp_title if composer had to be removed
                         title = tm['~cwp_title'] or tm['title']
-                        if self.DEBUG:
-                            log.debug("TITLE: %s", title)
                         if 'title' in tracks:
                             tracks['title'].append(title)
                         else:
@@ -5591,40 +5423,29 @@ class PartLevels():
                 track = tracks['track'][0][0]
                 # NB this will only be the first track of tracks, but its
                 # options will be used for the structure
-                self.derive_from_structure(
-                    top_info, tracks, height, depth, width, 'title')
+                self.derive_from_structure(release_id, top_info, tracks, height, depth, width, 'title')
                 if self.options[track]["cwp_level0_works"]:
                     # replace hierarchical works with those from work_0 (for
                     # consistency)
-                    self.derive_from_structure(
-                        top_info, tracks, height, depth, width, 'work')
+                    self.derive_from_structure(release_id, top_info, tracks, height, depth, width, 'work')
 
-                if self.DEBUG:
-                    log.debug(
-                        "Trackback result for %s = %s", parentId, tracks)
+                if self.INFO:
+                    write_log(release_id, 'info', "Trackback result for %s = %s", parentId, tracks)
                 response = parentId, tracks
-                if self.DEBUG:
-                    log.debug(
-                        "%s LEAVING PROCESS_CHILD_TRACKBACK depth %s Response = %s",
-                        PLUGIN_NAME,
-                        depth,
-                        response)
+                if self.DEBUG or self.INFO:
+                    write_log(release_id, 'debug', "LEAVING PROCESS_CHILD_TRACKBACK depth %s Response = %s",
+                              depth, response)
                 return response
             else:
                 return None
         else:
             return None
 
-    def derive_from_structure(
-            self,
-            top_info,
-            tracks,
-            height,
-            depth,
-            width,
-            name_type):
+    def derive_from_structure(self, release_id, top_info, tracks, height, depth, width, name_type):
         """
         Derive title (or work level-0) components from MB hierarchical work structure
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param top_info:
          {'levels': work_part_levels,'id': topId,'name': self.parts[topId]['name'],'single': single_work_album}
         :param tracks:
@@ -5643,45 +5464,40 @@ class PartLevels():
             # NB this will only be the first track of tracks, but its
             # options will be used for the structure
             single_work_track = False  # default
-            if self.DEBUG:
-                log.debug(
-                    "%s: Deriving info for %s from structure for tracks %s",
-                    PLUGIN_NAME,
-                    name_type,
-                    tracks['track'])
+            if self.DEBUG or self.INFO:
+                write_log(release_id, 'debug', "Deriving info for %s from structure for tracks %s",
+                          name_type, tracks['track'])
             if 'tracknumber' in tracks:
                 sorted_tracknumbers = sorted(tracks['tracknumber'])
             else:
                 sorted_tracknumbers = None
             if self.INFO:
-                log.info("SORTED TRACKNUMBERS: %s", sorted_tracknumbers)
+                write_log(release_id, 'info', "SORTED TRACKNUMBERS: %s", sorted_tracknumbers)
             common_len = 0
             if name_type in tracks:
                 meta_str = "_title" if name_type == 'title' else "_X0"
                 name_list = tracks[name_type]
-                if self.DEBUG:
-                    log.debug("%s list %s", name_type, name_list)
+                if self.INFO:
+                    write_log(release_id, 'info', "%s list %s", name_type, name_list)
                 # only one track in this work so try and extract using colons
                 if len(name_list) == 1:
                     single_work_track = True
                     track_height = tracks['track'][0][1]
                     if track_height - height > 0:  # part_level
                         if name_type == 'title':
-                            if self.DEBUG:
-                                log.debug(
-                                    "Single track work. Deriving directly from title text: %s", track)
+                            if self.DEBUG or self.INFO:
+                                write_log(release_id, 'debug',
+                                          "Single track work. Deriving directly from title text: %s", track)
                             ti = name_list[0]
-                            common_subset = self.derive_from_title(track, ti)[
+                            common_subset = self.derive_from_title(release_id, track, ti)[
                                 0]
                         else:
                             common_subset = ""
                     else:
                         common_subset = name_list[0]
                     if self.INFO:
-                        log.info(
-                            "%s is single-track work. common_subset is set to %s",
-                            tracks['track'][0][0],
-                            common_subset)
+                        write_log(release_id, 'info', "%s is single-track work. common_subset is set to %s",
+                                  tracks['track'][0][0], common_subset)
                     if common_subset:
                         common_len = len(common_subset)
                     else:
@@ -5697,19 +5513,15 @@ class PartLevels():
                         if lcs['length'] > 0:
                             common_subset = " ".join(compare)
                             if self.INFO:
-                                log.info(
-                                    "Common subset from %ss at level %s, item name %s ..........",
-                                    name_type,
-                                    tracks['track'][0][1] - height,
-                                    name)
+                                write_log(release_id, 'info',
+                                          "Common subset from %ss at level %s, item name %s ..........", name_type,
+                                          tracks['track'][0][1] - height, name)
                             if self.INFO:
-                                log.info("..........is %s", common_subset)
+                                write_log(release_id, 'info', "..........is %s", common_subset)
                             common_len = len(common_subset)
 
-                if self.DEBUG:
-                    log.debug(
-                        "checked for common sequence - length is %s",
-                        common_len)
+                if self.INFO:
+                    write_log(release_id, 'info', "checked for common sequence - length is %s", common_len)
             for i, track_item in enumerate(tracks['track']):
                 track_meta = track_item[0]
                 tm = track_meta.metadata
@@ -5717,11 +5529,8 @@ class PartLevels():
                 part_level = track_item[1] - height
                 if common_len > 0:
                     if self.INFO:
-                        log.info(
-                            "Use %s info for track: %s at level %s",
-                            name_type,
-                            track_meta,
-                            part_level)
+                        write_log(release_id, 'info', "Use %s info for track: %s at level %s", name_type, track_meta,
+                                  part_level)
                     name = tracks[name_type][i]
                     work = name[:common_len]
                     work = work.rstrip(":,.;- ")
@@ -5731,35 +5540,31 @@ class PartLevels():
                     else:
                         removewords = []
                     if self.INFO:
-                        log.info(
-                            "Removewords (in %s) = %s",
-                            name_type,
-                            removewords)
+                        write_log(release_id, 'info', "Removewords (in %s) = %s", name_type, removewords)
                     for prefix in removewords:
                         prefix2 = unicode(prefix).lower().rstrip()
                         if prefix2[0] != " ":
                             prefix2 = " " + prefix2
-                        if self.DEBUG:
-                            log.debug("checking prefix %s", prefix2)
+                        if self.INFO:
+                            write_log(release_id, 'info', "checking prefix %s", prefix2)
                         if work.lower().endswith(prefix2):
                             if len(prefix2) > 0:
                                 work = work[:-len(prefix2)]
                                 common_len = len(work)
                                 work = work.rstrip(":,.;- ")
                     if self.INFO:
-                        log.info("work after prefix strip %s", work)
-                    if self.DEBUG:
-                        log.debug("Prefixes checked")
+                        write_log(release_id, 'info', "work after prefix strip %s", work)
+                        write_log(release_id, 'info', "Prefixes checked")
 
                     tm['~cwp' + meta_str + '_work_' +
                         unicode(part_level)] = work
 
                     if part_level > 0 and name_type == "work":
                         if self.INFO:
-                            log.info(
-                                'checking if %s is repeated name at part_level = %s', work, part_level)
-                            log.info('lower work name is %s',
-                                     tm['~cwp' + meta_str + '_work_' + unicode(part_level - 1)])
+                            write_log(release_id, 'info', 'checking if %s is repeated name at part_level = %s', work,
+                                      part_level)
+                            write_log(release_id, 'info', 'lower work name is %s',
+                                      tm['~cwp' + meta_str + '_work_' + unicode(part_level - 1)])
                         # fill in missing names caused by no common string at lower levels
                         # count the missing levels and push the current name
                         # down to the lowest missing level
@@ -5772,9 +5577,7 @@ class PartLevels():
                             if fill_level < 0:
                                 break
                         if self.INFO:
-                            log.info(
-                                'there is/are %s missing level(s)',
-                                missing_levels)
+                            write_log(release_id, 'info', 'there is/are %s missing level(s)', missing_levels)
                         if missing_levels > 0:
                             allow_repeats = True
                         for lev in range(
@@ -5787,14 +5590,16 @@ class PartLevels():
                                    meta_str +
                                    '_part_' +
                                    unicode(lev -
-                                           1)] = self.strip_parent_from_work(tm['~cwp' +
-                                                                                meta_str +
-                                                                                '_work_' +
-                                                                                unicode(lev -
-                                                                                        1)], tm['~cwp' +
-                                                                                                meta_str +
-                                                                                                '_work_' +
-                                                                                                unicode(lev)], lev -
+                                           1)] = self.strip_parent_from_work(release_id, tm['~cwp' +
+                                                                                            meta_str +
+                                                                                            '_work_' +
+                                                                                            unicode(lev -
+                                                                                                    1)], tm['~cwp' +
+                                                                                                            meta_str +
+                                                                                                            '_work_' +
+                                                                                                            unicode(
+                                                                                                                lev)],
+                                                                             lev -
                                                                              1, False)[0]
                             else:
                                 tm['~cwp' +
@@ -5804,8 +5609,8 @@ class PartLevels():
                                                       unicode(lev)]
 
                         if missing_levels > 0 and self.INFO:
-                            log.info('lower work name is now %s',
-                                     tm['~cwp' + meta_str + '_work_' + unicode(part_level - 1)])
+                            write_log(release_id, 'info', 'lower work name is now %s',
+                                      tm['~cwp' + meta_str + '_work_' + unicode(part_level - 1)])
                         # now fix the repeated work name at this level
                         if work == tm['~cwp' + meta_str + '_work_' +
                                     unicode(part_level - 1)] and not allow_repeats:
@@ -5814,29 +5619,23 @@ class PartLevels():
                                '_work_' +
                                unicode(part_level)] = tm['~cwp_work_' +
                                                          unicode(part_level)]
-                            self.level0_warn(tm, part_level)
+                            self.level0_warn(release_id, tm, part_level)
                         tm['~cwp' +
                             meta_str + '_part_' +
                             unicode(part_level - 1)] = \
-                                self.strip_parent_from_work(
-                                    tm[
-                                        '~cwp' + meta_str + '_work_' +
-                                        unicode(part_level - 1)],
-                                    tm[
-                                        '~cwp' + meta_str + '_work_' +
-                                        unicode(part_level)],
-                                        part_level - 1, False)[0]
+                                self.strip_parent_from_work(release_id, tm[
+                                    '~cwp' + meta_str + '_work_' +
+                                    unicode(part_level - 1)], tm[
+                                                                '~cwp' + meta_str + '_work_' +
+                                                                unicode(part_level)], part_level - 1, False)[0]
 
                     if part_level == 1:
                         movt = name[common_len:].strip().lstrip(":,.;- ")
                         if self.INFO:
-                            log.info("%s - movt = %s", name_type, movt)
+                            write_log(release_id, 'info', "%s - movt = %s", name_type, movt)
                         tm['~cwp' + meta_str + '_part_0'] = movt
                     if self.INFO:
-                        log.info(
-                            "%s Work part_level = %s",
-                            name_type,
-                            part_level)
+                        write_log(release_id, 'info', "%s Work part_level = %s", name_type, part_level)
                     if name_type == 'title':
                         if '~cwp_title_work_' + unicode(part_level - 1) in tm and tm['~cwp_title_work_' + unicode(
                                 part_level)] == tm['~cwp_title_work_' + unicode(part_level - 1)] and width == 1:
@@ -5845,17 +5644,14 @@ class PartLevels():
                         else:
                             tm['~cwp_title_work_levels'] = depth
                             tm['~cwp_title_part_levels'] = part_level
-                    if self.DEBUG:
-                        log.debug("Set new metadata for %s OK", name_type)
+                    if self.INFO:
+                        write_log(release_id, 'info', "Set new metadata for %s OK", name_type)
                 else:  # (no common substring at this level)
                     if name_type == 'work':
                         if self.INFO:
-                            log.info(
-                                'single track work - indicator = %s. track = %s, part_level = %s, top_level = %s',
-                                single_work_track,
-                                track_item,
-                                part_level,
-                                top_level)
+                            write_log(release_id, 'info',
+                                      'single track work - indicator = %s. track = %s, part_level = %s, top_level = %s',
+                                      single_work_track, track_item, part_level, top_level)
                         if part_level >= top_level:  # so it won't be covered by top-down action
                             for level in range(
                                     0, part_level + 1):  # fill in the missing work names from the canonical list
@@ -5867,7 +5663,7 @@ class PartLevels():
                                        unicode(level)] = tm['~cwp_work_' +
                                                             unicode(level)]
                                     if level > 0:
-                                        self.level0_warn(tm, level)
+                                        self.level0_warn(release_id, tm, level)
                                 if '~cwp' + meta_str + '_part_' + \
                                         unicode(level) not in tm and '~cwp_part_' + unicode(level) in tm:
                                     tm['~cwp' +
@@ -5876,7 +5672,7 @@ class PartLevels():
                                        unicode(level)] = tm['~cwp_part_' +
                                                             unicode(level)]
                                     if level > 0:
-                                        self.level0_warn(tm, level)
+                                        self.level0_warn(release_id, tm, level)
 
                 # set movement number
                 if name_type == 'title':  # so we only do it once
@@ -5885,33 +5681,32 @@ class PartLevels():
                             curr_num = tracks['tracknumber'][i]
                             posn = sorted_tracknumbers.index(curr_num) + 1
                             if self.INFO:
-                                log.info("posn %s", posn)
+                                write_log(release_id, 'info', "posn %s", posn)
                         else:
                             posn = i + 1
                         tm['~cwp_movt_num'] = unicode(posn)
 
-    def level0_warn(self, tm, level):
+    def level0_warn(self, release_id, tm, level):
         """
         Issue warnings if inadequate level 0 data
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param tm:
         :param level:
         :return:
         """
-        if self.WARNING:
-            log.warning(
-                '%s: Unable to use level 0 as work name source in level %s - using hierarchy instead',
-                PLUGIN_NAME,
-                level)
-            self.append_tag(
-                tm,
-                '~cwp_warning',
-                '5. Unable to use level 0 as work name source in level ' +
-                unicode(level) +
-                ' - using hierarchy instead')
+        if self.WARNING or self.INFO:
+            write_log(release_id, 'warning',
+                      'Unable to use level 0 as work name source in level %s - using hierarchy instead', level)
+            self.append_tag(release_id, tm, '~cwp_warning', '5. Unable to use level 0 as work name source in level ' +
+                            unicode(level) +
+                            ' - using hierarchy instead')
 
-    def set_metadata(self, part_level, workId, parentId, parent, track):
+    def set_metadata(self, release_id, part_level, workId, parentId, parent, track):
         """
         Set the names of works and parts
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param part_level:
         :param workId:
         :param parentId:
@@ -5919,17 +5714,13 @@ class PartLevels():
         :param track:
         :return:
         """
-        if self.DEBUG:
-            log.debug(
-                "%s: SETTING METADATA FOR TRACK = %r, parent = %s, part_level = %s",
-                PLUGIN_NAME,
-                track,
-                parent,
-                part_level)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "SETTING METADATA FOR TRACK = %r, parent = %s, part_level = %s", track,
+                      parent, part_level)
         tm = track.metadata
-        self.write_tags(tm, workId, part_level)
         if parentId:
-            self.write_tags(tm, parentId, part_level)
+            self.write_tags(release_id, track, tm, parentId)
+            self.make_annotations(release_id, track, parentId)
             if 'annotations' in self.parts[workId]:
                 work_annotations = self.parts[workId]['annotations']
                 self.parts[workId]['stripped_annotations'] = work_annotations
@@ -5948,8 +5739,8 @@ class PartLevels():
             tm['~cwp_work_' + unicode(part_level)] = parent
             # maybe more than one work name
             work = self.parts[workId]['name']
-            if self.DEBUG:
-                log.debug("Set work name to: %s", work)
+            if self.INFO:
+                write_log(release_id, 'info', "Set work name to: %s", work)
             works = []
             # in case there is only one and it isn't in a list
             if isinstance(work, basestring):
@@ -5967,7 +5758,7 @@ class PartLevels():
                         parent = '; '.join(parent)
                     if not isinstance(work, basestring):
                         work = '; '.join(work)
-                    diff = self.diff_pair(track, tm, parent, work)
+                    diff = self.diff_pair(release_id, track, tm, parent, work)
                     if diff is None:
                         diff = ""
                     strip = [diff, parent]
@@ -5983,15 +5774,13 @@ class PartLevels():
                     if extra_words:
                         if not diff and 'arrangement' in self.parts[
                                 workId] and self.parts[workId]['arrangement']:
-                            strip = self.strip_parent_from_work(
-                                work, parent, part_level, False)
+                            strip = self.strip_parent_from_work(release_id, work, parent, part_level, False)
                 else:
                     extend = True
-                    strip = self.strip_parent_from_work(
-                        work, parent, part_level, extend, parentId)
+                    strip = self.strip_parent_from_work(release_id, work, parent, part_level, extend, parentId)
                 stripped_works.append(strip[0])
                 if self.INFO:
-                    log.info("Parent: %s", parent)
+                    write_log(release_id, 'info', "Parent: %s", parent)
                 # now == parent, after removing full_parent logic
                 full_parent = strip[1]
                 if full_parent != parent:
@@ -6003,28 +5792,80 @@ class PartLevels():
                             tm['~cwp_work_top'] = full_parent.strip()
             tm['~cwp_part_' + unicode(part_level - 1)] = stripped_works
             self.parts[workId]['stripped_name'] = stripped_works
-        if self.DEBUG:
-            log.debug("GOT TO END OF SET_METADATA")
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "GOT TO END OF SET_METADATA")
 
-    def write_tags(self, tm, workId, part_level):
-        self.append_tag(tm, '~cwp_candidate_genres', self.parts[workId]['genres'])
-        self.append_tag(tm, '~cwp_keys', self.parts[workId]['key'])
-        self.append_tag(tm, '~cwp_composed_dates', self.parts[workId]['composed_dates'])
-        self.append_tag(tm, '~cwp_published_dates', self.parts[workId]['published_dates'])
-        self.append_tag(tm, '~cwp_premiered_dates', self.parts[workId]['premiered_dates'])
+    def write_tags(self, release_id, track, tm, workId):
+        """
+        write genre-realated tags from internal variables
+        :param track:
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
+        :param tm: track metadata
+        :param workId: MBID of current work
+        :return: None - just writes tags
+        """
+        options = self.options[track]
+        candidate_genres = []
+        if options['cwp_genres_use_folks'] and 'folks_genres' in self.parts[workId]:
+            candidate_genres += self.parts[workId]['folks_genres']
+        if options['cwp_genres_use_worktype'] and 'worktype_genres' in self.parts[workId]:
+            candidate_genres += self.parts[workId]['worktype_genres']
+        self.append_tag(release_id, tm, '~cwp_candidate_genres', candidate_genres)
+        self.append_tag(release_id, tm, '~cwp_keys', self.parts[workId]['key'])
+        self.append_tag(release_id, tm, '~cwp_composed_dates', self.parts[workId]['composed_dates'])
+        self.append_tag(release_id, tm, '~cwp_published_dates', self.parts[workId]['published_dates'])
+        self.append_tag(release_id, tm, '~cwp_premiered_dates', self.parts[workId]['premiered_dates'])
 
-    def derive_from_title(self, track, title):
+    def make_annotations(self, release_id, track, wid):
+        """
+        create an 'annotations' entry in the 'parts' dict, as dictated by options, from dates and keys
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
+        :param track: the current track
+        :param wid: the current work MBID
+        :return:
+        """
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Starting module %s", 'make_annotations')
+        options = self.options[track]
+        if options['cwp_workdate_include']:
+            if options['cwp_workdate_source_composed'] and 'composed_dates' in self.parts[wid] and self.parts[wid]['composed_dates']:
+                workdates = self.parts[wid]['composed_dates']
+            elif options['cwp_workdate_source_published'] and 'published_dates' in self.parts[wid] and self.parts[wid]['published_dates']:
+                workdates = self.parts[wid]['published_dates']
+            elif options['cwp_workdate_source_premiered'] and 'premiered_dates' in self.parts[wid] and self.parts[wid]['premiered_dates']:
+                workdates = self.parts[wid]['premiered_dates']
+            else:
+                workdates = []
+        else:
+            workdates = []
+        if options['cwp_key_include'] and 'key' in self.parts[wid] and self.parts[wid]['key']:
+            keys = self.parts[wid]['key']
+        else:
+            keys = []
+        annotations = keys + workdates
+        if annotations:
+            self.parts[wid]['annotations'] = annotations
+        else:
+            if 'annotations' in self.parts[wid]:
+                del self.parts[wid]['annotations']
+        write_log(release_id, 'info', 'make annotations has set id %s on track %s with annotation %s', wid, track,
+                  annotations)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Ending module %s", 'make_annotations')
+
+    def derive_from_title(self, release_id, track, title):
         """
         Attempt to parse title to get components
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param track:
         :param title:
         :return:
         """
         if self.INFO:
-            log.info(
-                "%s: DERIVING METADATA FROM TITLE for track: %s",
-                PLUGIN_NAME,
-                track)
+            write_log(release_id, 'info', "DERIVING METADATA FROM TITLE for track: %s", track)
         tm = track.metadata
         movt = title
         work = ""
@@ -6043,13 +5884,15 @@ class PartLevels():
                         work = title_split[0]
                         movt = title_split[1]
         if self.INFO:
-            log.info("Work %s, Movt %s", work, movt)
+            write_log(release_id, 'info', "Work %s, Movt %s", work, movt)
         return work, movt
 
-    def process_work_artists(self, album, track, workIds, tm, count):
+    def process_work_artists(self, release_id, album, track, workIds, tm, count):
         """
         Carry out the artist processing that needs to be done in the PartLevels class
         as it requires XML lookups of the works
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :param track:
         :param workIds:
@@ -6058,40 +5901,29 @@ class PartLevels():
         :return:
         """
         if not self.options[track]['classical_extra_artists']:
-            if self.DEBUG:
-                log.debug(
-                    '%s: Not processing work_artists as ExtraArtists not selected to be run',
-                    PLUGIN_NAME)
+            if self.DEBUG or self.INFO:
+                write_log(release_id, 'debug', 'Not processing work_artists as ExtraArtists not selected to be run')
             return None
-        if self.DEBUG:
-            log.debug(
-                '%s: In process_work_artists for track: %s, workIds: %s',
-                PLUGIN_NAME,
-                track,
-                workIds)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', 'In process_work_artists for track: %s, workIds: %s', track, workIds)
         if workIds in self.parts and 'arrangers' in self.parts[workIds]:
             if self.INFO:
-                log.info('Arrangers = %s', self.parts[workIds]['arrangers'])
-            set_work_artists(
-                self,
-                album,
-                track,
-                self.parts[workIds]['arrangers'],
-                tm,
-                count)
+                write_log(release_id, 'info', 'Arrangers = %s', self.parts[workIds]['arrangers'])
+            set_work_artists(self, release_id, album, track, self.parts[workIds]['arrangers'], tm, count)
         if workIds in self.works_cache:
             count += 1
-            self.process_work_artists(
-                album, track, tuple(
-                    self.works_cache[workIds]), tm, count)
+            self.process_work_artists(release_id, album, track, tuple(
+                self.works_cache[workIds]), tm, count)
 
     #################################################
-    # SECTION 4 - Extend work metadata using titles #
+    # SECTION 5 - Extend work metadata using titles #
     #################################################
 
-    def extend_metadata(self, top_info, track, ref_height, depth):
+    def extend_metadata(self, release_id, top_info, track, ref_height, depth):
         """
         Combine MB work and title data according to user options
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param top_info:
         :param track:
         :param ref_height:
@@ -6101,16 +5933,12 @@ class PartLevels():
         tm = track.metadata
         options = self.options[track]
         part_levels = int(tm['~cwp_part_levels'])
-        if self.DEBUG:
-            log.debug(
-                "%s: Extending metadata for track: %s, ref_height: %s, depth: %s, part_levels: %s",
-                PLUGIN_NAME,
-                track,
-                ref_height,
-                depth,
-                part_levels)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug',
+                      "Extending metadata for track: %s, ref_height: %s, depth: %s, part_levels: %s",
+                      track, ref_height, depth, part_levels)
         if self.INFO:
-            log.info("Metadata = %s", tm)
+            write_log(release_id, 'info', "Metadata = %s", tm)
 
         # previously: ref_height = work_part_levels - ref_level,
         # where this ref-level is the level for the top-named work
@@ -6176,16 +6004,31 @@ class PartLevels():
 
         # add any annotations for dates and keys
         if options['cwp_workdate_include'] or options['cwp_key_include']:
+            if options["cwp_titles"] and part_levels == 0:
+                # ~cwp_title_work_0 will not have been set, but need it to hold any annotations
+                tm['~cwp_title_work_0'] = tm['~cwp_title'] or tm['title']
             for lev in range(0, part_levels + 1):
                 if '~cwp_workid_' + unicode(lev) in tm:
                     tup_id = interpret(tm['~cwp_workid_' + unicode(lev)])
                     if 'annotations' in self.parts[tup_id]:
+                        write_log(release_id, 'info', 'in extend_metadata, annotations for id %s on track %s are %s',
+                                  tup_id, track, self.parts[tup_id]['annotations'])
                         tm['~cwp_work_' + unicode(lev)] += " (" + ', '.join(self.parts[tup_id]['annotations']) + ")"
+                        if options["cwp_level0_works"] and '~cwp_X0_work_' + unicode(lev) in tm:
+                            tm['~cwp_X0_work_' + unicode(lev)] += " (" + ', '.join(self.parts[tup_id]['annotations']) + ")"
+                        if options["cwp_titles"] and '~cwp_title_work_' + unicode(lev) in tm:
+                                tm['~cwp_title_work_' + unicode(lev)] += " (" + ', '.join(self.parts[tup_id]['annotations']) + ")"
                         if lev < part_levels:
                             if 'stripped_annotations' in self.parts[tup_id]:
                                 if self.parts[tup_id]['stripped_annotations']:
                                     tm['~cwp_part_' + unicode(lev)] += " (" + ', '.join(
                                         self.parts[tup_id]['stripped_annotations']) + ")"
+                                    if options["cwp_level0_works"] and '~cwp_X0_part_' + unicode(lev) in tm:
+                                        tm['~cwp_X0_part_' + unicode(lev)] += " (" + ', '.join(
+                                            self.parts[tup_id]['stripped_annotations']) + ")"
+                                    if options["cwp_titles"] and '~cwp_title_part_' + unicode(lev) in tm:
+                                            tm['~cwp_title_part' + unicode(lev)] += " (" + ', '.join(
+                                                self.parts[tup_id]['stripped_annotations']) + ")"
 
 
         part = []
@@ -6245,8 +6088,8 @@ class PartLevels():
         tm['~cwp_work'] = work_main
         tm['~cwp_inter_work'] = inter_work
         tm['~cwp_title_work'] = work_titles
-        if self.DEBUG:
-            log.debug("Groupheading set to: %s", groupheading)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Groupheading set to: %s", groupheading)
         # extend group heading from title metadata
         if groupheading:
             ext_groupheading = groupheading
@@ -6259,7 +6102,7 @@ class PartLevels():
 
                 title_depth = int(tm['~cwp_title_work_levels'])
                 if self.INFO:
-                    log.info("Title_depth: %s", title_depth)
+                    write_log(release_id, 'info', "Title_depth: %s", title_depth)
                 diff_work = [""] * ref_level
                 diff_part = [""] * ref_level
                 title_tag = [""]
@@ -6268,67 +6111,58 @@ class PartLevels():
                 for d in range(1, max_d):
                     tw_str = '~cwp_title_work_' + unicode(d)
                     if self.INFO:
-                        log.info("TW_STR = %s", tw_str)
+                        write_log(release_id, 'info', "TW_STR = %s", tw_str)
                     if tw_str in tm:
                         title_tag.append(tm[tw_str])
                         title_work = title_tag[d]
                         work_main = work[d]
                         diff_work[d -
-                                  1] = self.diff_pair(track, tm, work_main, title_work)
+                                  1] = self.diff_pair(release_id, track, tm, work_main, title_work)
                         if d > 1 and tw_str_lower in tm:
-                            title_part = self.strip_parent_from_work(
-                                tm[tw_str_lower], tm[tw_str], 0, False)[0].strip()
+                            title_part = self.strip_parent_from_work(release_id, tm[tw_str_lower], tm[tw_str], 0,
+                                                                     False)[0].strip()
                             tm['~cwp_title_part_' +
                                 unicode(d - 1)] = title_part
                             part_n = part[d - 1]
                             diff_part[d -
-                                      1] = self.diff_pair(track, tm, part_n, title_part) or ""
+                                      1] = self.diff_pair(release_id, track, tm, part_n, title_part) or ""
                     else:
                         title_tag.append('')
                     tw_str_lower = tw_str
                 if self.INFO:
-                    log.info("diff list for works: %s", diff_work)
+                    write_log(release_id, 'info', "diff list for works: %s", diff_work)
                 if self.INFO:
-                    log.info("diff list for parts: %s", diff_part)
+                    write_log(release_id, 'info', "diff list for parts: %s", diff_part)
                 if not diff_work or len(diff_work) == 0:
                     if part_levels > 0:
                         ext_groupheading = groupheading
                 else:
-                    if self.DEBUG:
-                        log.debug("Now calc extended groupheading...")
+                    if self.DEBUG or self.INFO:
+                        write_log(release_id, 'debug', "Now calc extended groupheading...")
                     if self.INFO:
-                        log.info(
-                            "depth = %s, ref_level = %s, title_depth = %s",
-                            depth,
-                            ref_level,
-                            title_depth)
+                        write_log(release_id, 'info', "depth = %s, ref_level = %s, title_depth = %s", depth, ref_level,
+                                  title_depth)
                     if self.INFO:
-                        log.info(
-                            "diff_work = %s, diff_part = %s",
-                            diff_work,
-                            diff_part)
+                        write_log(release_id, 'info', "diff_work = %s, diff_part = %s", diff_work, diff_part)
                     if part_levels > 0 and depth >= 1:
                         addn_work = []
                         addn_part = []
                         for stripped_work in diff_work:
                             if stripped_work:
                                 if self.INFO:
-                                    log.info(
-                                        "Stripped work = %s", stripped_work)
+                                    write_log(release_id, 'info', "Stripped work = %s", stripped_work)
                                 addn_work.append(" {" + stripped_work + "}")
                             else:
                                 addn_work.append("")
                         for stripped_part in diff_part:
                             if stripped_part and stripped_part != "":
                                 if self.INFO:
-                                    log.info(
-                                        "Stripped part = %s", stripped_part)
+                                    write_log(release_id, 'info', "Stripped part = %s", stripped_part)
                                 addn_part.append(" {" + stripped_part + "}")
                             else:
                                 addn_part.append("")
                         if self.INFO:
-                            log.info(
-                                "addn_work = %s, addn_part = %s", addn_work, addn_part)
+                            write_log(release_id, 'info', "addn_work = %s, addn_part = %s", addn_work, addn_part)
                         ext_groupheading = work[1] + addn_work[0]
                         ext_work = work[ref_level] + addn_work[ref_level - 1]
                         ext_inter_work = ""
@@ -6357,12 +6191,12 @@ class PartLevels():
                         ext_inter_work = inter_work
                         inter_title_work = ""
 
-                    if self.DEBUG:
-                        log.debug(".... ext_groupheading done")
+                    if self.DEBUG or self.INFO:
+                        write_log(release_id, 'debug', ".... ext_groupheading done")
 
             if ext_groupheading:
                 if self.INFO:
-                    log.info("EXTENDED GROUPHEADING: %s", ext_groupheading)
+                    write_log(release_id, 'info', "EXTENDED GROUPHEADING: %s", ext_groupheading)
                 tm['~cwp_extended_groupheading'] = ext_groupheading
                 tm['~cwp_extended_work'] = ext_work
                 if ext_inter_work:
@@ -6372,32 +6206,29 @@ class PartLevels():
                 if title_groupheading:
                     tm['~cwp_title_groupheading'] = title_groupheading
                     if self.INFO:
-                        log.info("title_groupheading = %s", title_groupheading)
+                        write_log(release_id, 'info', "title_groupheading = %s", title_groupheading)
         # extend part from title metadata
-        if self.DEBUG:
-            log.debug(
-                "%s: Now extend part...(part = %s)",
-                PLUGIN_NAME,
-                part_main)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Now extend part...(part = %s)", part_main)
         if part_main:
             if '~cwp_title_part_0' in tm:
                 movement = tm['~cwp_title_part_0']
             else:
-                movement = tm['~cwp_title'] or tm['title']
-            diff = self.diff_pair(track, tm, work[0], movement)
+                movement = tm['~cwp_title_part_0'] or tm['~cwp_title'] or tm['title']
+            diff = self.diff_pair(release_id, track, tm, work[0], movement)
             # compare with the full work name, not the stripped one unless it
             # results in nothing
             if not diff and not vanilla_part:
-                diff = self.diff_pair(track, tm, part_main, movement)
+                diff = self.diff_pair(release_id, track, tm, part_main, movement)
             if self.INFO:
-                log.info("DIFF PART - MOVT. ti =%s", diff)
+                write_log(release_id, 'info', "DIFF PART - MOVT. ti =%s", diff)
             diff2 = diff
             if diff:
                 if '~cwp_work_1' in tm:
                     if self.parts[interpret(tm['~cwp_workid_0'])]['partial']:
                         no_diff = False
                     else:
-                        diff2 = self.diff_pair(track, tm, work[1], diff)
+                        diff2 = self.diff_pair(release_id, track, tm, work[1], diff)
                         if diff2:
                             no_diff = False
                         else:
@@ -6407,17 +6238,14 @@ class PartLevels():
             else:
                 no_diff = True
             if self.INFO:
-                log.info(
-                    'Set no_diff for %s = %s',
-                    tm['~cwp_workid_0'],
-                    no_diff)
-                log.info('medley indicator for %s is %s', tm['~cwp_workid_0'],
-                         self.parts[interpret(tm['~cwp_workid_0'])]['medley'])
+                write_log(release_id, 'info', 'Set no_diff for %s = %s', tm['~cwp_workid_0'], no_diff)
+                write_log(release_id, 'info', 'medley indicator for %s is %s', tm['~cwp_workid_0'],
+                          self.parts[interpret(tm['~cwp_workid_0'])]['medley'])
             if self.parts[interpret(tm['~cwp_workid_0'])
                           ]['medley'] and options['cwp_medley']:
                 no_diff = False
                 if self.INFO:
-                    log.info('setting no_diff = %s', no_diff)
+                    write_log(release_id, 'info', 'setting no_diff = %s', no_diff)
             if no_diff:
                 if part_levels > 0:
                     tm['~cwp_extended_part'] = part_main
@@ -6455,59 +6283,61 @@ class PartLevels():
                ':').strip(
                options['cwp_single_work_sep']).strip(
                options['cwp_multi_work_sep'])
-        if self.DEBUG:
-            log.debug("....done")
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "....done")
         return None
 
     ##########################################################
-    # SECTION 5- Write metadata to tags according to options #
+    # SECTION 6- Write metadata to tags according to options #
     ##########################################################
 
-    def publish_metadata(self, album, track):
+    def publish_metadata(self, release_id, album, track):
         """
         Write out the metadata according to user options
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param album:
         :param track:
         :return:
         """
-        if self.DEBUG:
-            log.debug("%s: IN PUBLISH METADATA for %s", PLUGIN_NAME, track)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "IN PUBLISH METADATA for %s", track)
         options = self.options[track]
         tm = track.metadata
         tm['~cwp_version'] = PLUGIN_VERSION
         # album composers needed by map_tags (set in set_work_artists)
         if 'composer_lastnames' in self.album_artists[album]:
             last_names = seq_last_names(self, album)
-            self.append_tag(tm, '~cea_album_composer_lastnames', last_names)
+            self.append_tag(release_id, tm, '~cea_album_composer_lastnames', last_names)
 
-        if self.DEBUG:
-            log.debug("Check options")
+        if self.INFO:
+            write_log(release_id, 'info', "Check options")
         if options["cwp_titles"]:
-            if self.DEBUG:
-                log.debug("titles")
-            part = tm['~cwp_title_part_0'] or tm['~cwp_title'] or tm['title']
+            if self.INFO:
+                write_log(release_id, 'info', "titles")
+            part = tm['~cwp_title_part_0'] or tm['~cwp_title_work_0']or tm['~cwp_title'] or tm['title']
             # for multi-level work display
             groupheading = tm['~cwp_title_groupheading'] or ""
             # for single-level work display
             work = tm['~cwp_title_work'] or ""
             inter_work = tm['~cwp_inter_title_work'] or ""
         elif options["cwp_works"]:
-            if self.DEBUG:
-                log.debug("works")
+            if self.INFO:
+                write_log(release_id, 'info', "works")
             part = tm['~cwp_part']
             groupheading = tm['~cwp_groupheading'] or ""
             work = tm['~cwp_work'] or ""
             inter_work = tm['~cwp_inter_work'] or ""
         else:
             # options["cwp_extended"]
-            if self.DEBUG:
-                log.debug("extended")
+            if self.INFO:
+                write_log(release_id, 'info', "extended")
             part = tm['~cwp_extended_part']
             groupheading = tm['~cwp_extended_groupheading'] or ""
             work = tm['~cwp_extended_work'] or ""
             inter_work = tm['~cwp_extended_inter_work'] or ""
-        if self.DEBUG:
-            log.debug("Done options")
+        if self.INFO:
+            write_log(release_id, 'info', "Done options")
         p1 = re.compile(
             r'^\W*\bM{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})\b[\s|\.|:|,|;]',
             re.IGNORECASE)  # Matches Roman numerals with punctuation
@@ -6517,8 +6347,8 @@ class PartLevels():
         for _ in range(
                 0, 5):  # in case of multiple levels
             movt = p2.sub('', p1.sub('', movt)).strip()
-        if self.DEBUG:
-            log.debug("Done movt")
+        if self.INFO:
+            write_log(release_id, 'info', "Done movt")
         movt_inc_tags = options["cwp_movt_tag_inc"].split(",")
         movt_inc_tags = [x.strip(' ') for x in movt_inc_tags]
         movt_exc_tags = options["cwp_movt_tag_exc"].split(",")
@@ -6539,43 +6369,39 @@ class PartLevels():
         top_tags = options["cwp_top_tag"].split(",")
         top_tags = [x.strip(' ') for x in top_tags]
 
-        if self.DEBUG:
-            log.debug(
-                "Done splits. gh_tags: %s, work_tags: %s, movt_inc_tags: %s, movt_exc_tags: %s, movt_no_tags: %s",
-                gh_tags,
-                work_tags,
-                movt_inc_tags,
-                movt_exc_tags,
-                movt_no_tags)
+        if self.INFO:
+            write_log(release_id, 'info',
+                      "Done splits. gh_tags: %s, work_tags: %s, movt_inc_tags: %s, movt_exc_tags: %s, movt_no_tags: %s",
+                      gh_tags, work_tags, movt_inc_tags, movt_exc_tags, movt_no_tags)
 
         for tag in gh_tags + work_tags + movt_inc_tags + movt_exc_tags + movt_no_tags:
             tm[tag] = ""
         for tag in gh_tags:
             if tag in movt_inc_tags + movt_exc_tags + movt_no_tags:
-                self.append_tag(tm, tag, groupheading, gh_sep)
+                self.append_tag(release_id, tm, tag, groupheading, gh_sep)
             else:
-                self.append_tag(tm, tag, groupheading)
+                self.append_tag(release_id, tm, tag, groupheading)
         for tag in work_tags:
             if tag in movt_inc_1_tags + movt_exc_1_tags + movt_no_tags:
-                self.append_tag(tm, tag, work, work_sep)
+                self.append_tag(release_id, tm, tag, work, work_sep)
             else:
-                self.append_tag(tm, tag, work)
+                self.append_tag(release_id, tm, tag, work)
             if '~cwp_part_levels' in tm and int(tm['~cwp_part_levels']) > 0:
-                self.append_tag(tm, 'show work movement', '1')  # for iTunes
+                self.append_tag(release_id, tm, 'show work movement', '1')  # for iTunes
         for tag in top_tags:
             if '~cwp_work_top' in tm:
-                self.append_tag(tm, tag, tm['~cwp_work_top'])
+                self.append_tag(release_id, tm, tag, tm['~cwp_work_top'])
 
         for tag in movt_no_tags:
-            self.append_tag(tm, tag, tm['~cwp_movt_num'])
+            self.append_tag(release_id, tm, tag, tm['~cwp_movt_num'])
             if tag in movt_inc_tags + movt_exc_tags:
-                self.append_tag(tm, tag, movt_no_sep)
+                self.append_tag(release_id, tm, tag, movt_no_sep)
 
         for tag in movt_exc_tags:
-            self.append_tag(tm, tag, movt)
+            self.append_tag(release_id, tm, tag, movt)
 
         for tag in movt_inc_tags:
-            self.append_tag(tm, tag, part)
+            self.append_tag(release_id, tm, tag, part)
 
         for tag in movt_inc_1_tags + movt_exc_1_tags:
             if tag in movt_inc_1_tags:
@@ -6584,17 +6410,14 @@ class PartLevels():
                 pt = movt
             if inter_work and inter_work != "":
                 if tag in movt_exc_tags + movt_inc_tags and tag != "":
-                    if self.WARNING:
-                        log.warning("Tag %s will have multiple contents", tag)
-                    self.append_tag(
-                        tm,
-                        '~cwp_warning',
-                        '6. Tag ' +
-                        tag +
-                        ' has multiple contents')
-                self.append_tag(tm, tag, inter_work + work_sep + " " + pt)
+                    if self.WARNING or self.INFO:
+                        write_log(release_id, 'warning', "Tag %s will have multiple contents", tag)
+                    self.append_tag(release_id, tm, '~cwp_warning', '6. Tag ' +
+                                    tag +
+                                    ' has multiple contents')
+                self.append_tag(release_id, tm, tag, inter_work + work_sep + " " + pt)
             else:
-                self.append_tag(tm, tag, pt)
+                self.append_tag(release_id, tm, tag, pt)
 
         for tag in movt_exc_tags + movt_inc_tags + movt_exc_1_tags + movt_inc_1_tags:
             if tag in movt_no_tags:
@@ -6603,8 +6426,8 @@ class PartLevels():
 
         # write "SongKong" tags
         if options['cwp_write_sk']:
-            if self.DEBUG:
-                log.debug("%s: writing SongKong work tags", PLUGIN_NAME)
+            if self.DEBUG or self.INFO:
+                write_log(release_id, 'debug', "Writing SongKong work tags")
             if '~cwp_part_levels' in tm:
                 part_levels = int(tm['~cwp_part_levels'])
                 for n in range(0, part_levels + 1):
@@ -6613,33 +6436,29 @@ class PartLevels():
                         source = tm['~cwp_work_' + unicode(n)]
                         source_id = list(interpret(tm['~cwp_workid_' + unicode(n)]))
                         if n == 0:
-                            self.append_tag(
-                                tm, 'musicbrainz_work_composition', source)
+                            self.append_tag(release_id, tm, 'musicbrainz_work_composition', source)
                             for source_id_item in source_id:
-                                self.append_tag(
-                                    tm, 'musicbrainz_work_composition_id', source_id_item)
+                                self.append_tag(release_id, tm, 'musicbrainz_work_composition_id', source_id_item)
                         if n == part_levels:
-                            self.append_tag(tm, 'musicbrainz_work', source)
+                            self.append_tag(release_id, tm, 'musicbrainz_work', source)
                             if 'musicbrainz_workid' in tm:
                                 del tm['musicbrainz_workid']
                             # Delete the Picard version of this tag before
                             # replacing it with the SongKong version
                             for source_id_item in source_id:
-                                self.append_tag(
-                                    tm, 'musicbrainz_workid', source_id_item)
+                                self.append_tag(release_id, tm, 'musicbrainz_workid', source_id_item)
                         if n != 0 and n != part_levels:
-                            self.append_tag(
-                                tm, 'musicbrainz_work_part_level' + unicode(n), source)
+                            self.append_tag(release_id, tm, 'musicbrainz_work_part_level' + unicode(n), source)
                             for source_id_item in source_id:
-                                self.append_tag(
-                                    tm, 'musicbrainz_work_part_level' + unicode(n) + '_id', source_id_item)
+                                self.append_tag(release_id, tm, 'musicbrainz_work_part_level' + unicode(n) + '_id',
+                                                source_id_item)
 
         # carry out tag mapping
         tm['~cea_works_complete'] = "Y"
-        map_tags(options, album, tm)
+        map_tags(options, release_id, album, tm)
 
-        if self.DEBUG:
-            log.debug("Published metadata for %s", track)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Published metadata for %s", track)
         if options['cwp_options_tag'] != "":
             self.cwp_options = collections.defaultdict(
                 lambda: collections.defaultdict(dict))
@@ -6654,63 +6473,51 @@ class PartLevels():
                                                                               ] = options[opt['option']]
 
             if self.INFO:
-                log.info("Options %s", self.cwp_options)
+                write_log(release_id, 'info', "Options %s", self.cwp_options)
             if options['ce_version_tag'] and options['ce_version_tag'] != "":
-                self.append_tag(tm, options['ce_version_tag'], unicode(
+                self.append_tag(release_id, tm, options['ce_version_tag'], unicode(
                     'Version ' + tm['~cwp_version'] + ' of Classical Extras'))
             if options['cwp_options_tag'] and options['cwp_options_tag'] != "":
-                self.append_tag(
-                    tm,
-                    options['cwp_options_tag'] +
-                    ':workparts_options',
-                    json.loads(
-                        json.dumps(
-                            self.cwp_options)))
+                self.append_tag(release_id, tm, options['cwp_options_tag'] +
+                                ':workparts_options', json.loads(
+                    json.dumps(
+                        self.cwp_options)))
         if self.ERROR and "~cwp_error" in tm:
             for error in str_to_list(tm['~cwp_error']):
                 code = error[0]
-                self.append_tag(tm, '001_errors:' + code, error)
+                self.append_tag(release_id, tm, '001_errors:' + code, error)
         if self.WARNING and "~cwp_warning" in tm:
             for warning in str_to_list(tm['~cwp_warning']):
                 wcode = warning[0]
-            self.append_tag(tm, '002_warnings:' + wcode, warning)
+            self.append_tag(release_id, tm, '002_warnings:' + wcode, warning)
 
-    def append_tag(self, tm, tag, source, sep=None):
+    def append_tag(self, release_id, tm, tag, source, sep=None):
         """
         pass to main append routine
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param tm:
         :param tag:
         :param source:
         :param sep: separators may be used to split string into list on appending
         :return:
         """
-        if self.DEBUG:
-            log.debug(
-                "In append_tag (Work parts). tag = %s, source = %s, sep =%s",
-                tag,
-                source,
-                sep)
-        append_tag(tm, tag, source, self.SEPARATORS)
-        if self.DEBUG:
-            log.debug(
-                "Appended. Resulting contents of tag: %s are: %s",
-                tag,
-                tm[tag]
-            )
+        if self.INFO:
+            write_log(release_id, 'info', "In append_tag (Work parts). tag = %s, source = %s, sep =%s", tag, source,
+                      sep)
+        append_tag(release_id, tm, tag, source, self.SEPARATORS)
+        if self.INFO:
+            write_log(release_id, 'info', "Appended. Resulting contents of tag: %s are: %s", tag, tm[tag])
 
     ################################################
-    # SECTION 6 - Common string handling functions #
+    # SECTION 7 - Common string handling functions #
     ################################################
 
-    def strip_parent_from_work(
-            self,
-            work,
-            parent,
-            part_level,
-            extend,
-            parentId=None):
+    def strip_parent_from_work(self, release_id, work, parent, part_level, extend, parentId=None):
         """
         Remove common text
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param work:
         :param parent:
         :param part_level:
@@ -6722,10 +6529,8 @@ class PartLevels():
         #  to trigger recursion if unable to strip parent name from work
         # extend=False is used when this routine is called for other purposes
         # than strict work: parent relationships
-        if self.DEBUG:
-            log.debug(
-                "%s: STRIPPING HIGHER LEVEL WORK TEXT FROM PART NAMES",
-                PLUGIN_NAME)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "STRIPPING HIGHER LEVEL WORK TEXT FROM PART NAMES")
         if not isinstance(parent, basestring):
             # in case it is a list - make sure it is a string
             parent = '; '.join(parent)
@@ -6744,12 +6549,12 @@ class PartLevels():
         else:
             pattern_parent = "(.*\s|^)(\W*" + pattern_parent + "\w*\W?)(.*)"
         if self.INFO:
-            log.info("Pattern parent: %s, Work: %s", pattern_parent, work)
+            write_log(release_id, 'info', "Pattern parent: %s, Work: %s", pattern_parent, work)
         p = re.compile(pattern_parent, re.IGNORECASE | re.UNICODE)
         m = p.search(work)
         if m:
-            if self.DEBUG:
-                log.debug("Matched...")
+            if self.INFO:
+                write_log(release_id, 'info', "Matched...")
             if extend:
                 if m.group(1):
                     stripped_work = m.group(1) + u'\u2026' + m.group(4)
@@ -6777,16 +6582,16 @@ class PartLevels():
             #             full_parent = parent
             #             stripped_work = m.group(4)
         else:
-            if self.DEBUG:
-                log.debug("No match...")
+            if self.INFO:
+                write_log(release_id, 'info', "No match...")
 
             if extend and parentId and parentId in self.works_cache:
-                if self.DEBUG:
-                    log.debug("Looking for match at next level up")
+                if self.INFO:
+                    write_log(release_id, 'info', "Looking for match at next level up")
                 grandparentIds = tuple(self.works_cache[parentId])
                 grandparent = self.parts[grandparentIds]['name']
-                stripped_work = self.strip_parent_from_work(
-                    work, grandparent, part_level, True, grandparentIds)[0]
+                stripped_work = self.strip_parent_from_work(release_id, work, grandparent, part_level, True,
+                                                            grandparentIds)[0]
 
             else:
                 stripped_work = work
@@ -6799,35 +6604,36 @@ class PartLevels():
             common_seq = common_dets['sequence']
             seq_length = common_dets['length']
             if self.INFO:
-                log.info(
-                    'Checking common sequence between parent and work. Longest sequence = %s',
-                    common_seq)
+                write_log(release_id, 'info', 'Checking common sequence between parent and work. Longest sequence = %s',
+                          common_seq)
             if seq_length > 0:  # Make sure it is non-trivial
                 # self.strip_parent_from_work(work, common_seq, part_level, False)[0]
                 stripped_work = ''.join(work_words[seq_length:]).lstrip(' :,-')
         if self.INFO:
-            log.info("Work: %s", work)
+            write_log(release_id, 'info', "Work: %s", work)
         if self.INFO:
-            log.info("Stripped work: %s", stripped_work)
+            write_log(release_id, 'info', "Stripped work: %s", stripped_work)
         # Changed full_parent to parent after removal of 'extend' logic above
         return stripped_work, parent
 
-    def diff_pair(self, track, tm, mb_item, title_item):
+    def diff_pair(self, release_id, track, tm, mb_item, title_item):
         """
         Removes common text from title item
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param track:
         :param tm:
         :param mb_item:
         :param title_item:
         :return: Reduced title item
         """
-        if self.DEBUG:
-            log.debug("%s: Inside DIFF_PAIR", PLUGIN_NAME)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "Inside DIFF_PAIR")
         mb = mb_item.strip()
         if self.INFO:
-            log.info("mb = %s", mb)
+            write_log(release_id, 'info', "mb = %s", mb)
         if self.INFO:
-            log.info("title_item = %s", title_item)
+            write_log(release_id, 'info', "title_item = %s", title_item)
         if not mb:
             return None
         ti = title_item.strip(" :;-.,")
@@ -6836,7 +6642,7 @@ class PartLevels():
         if ti.count("'") == 1:
             ti = ti.strip("'")
         if self.INFO:
-            log.info("ti (amended) = %s", ti)
+            write_log(release_id, 'info', "ti (amended) = %s", ti)
         if not ti:
             return None
         p1 = re.compile(
@@ -6850,11 +6656,11 @@ class PartLevels():
         else:
             removewords = []
         if self.INFO:
-            log.info("Removewords = %s", removewords)
+            write_log(release_id, 'info', "Removewords = %s", removewords)
         # remove numbers, roman numerals, part etc and punctuation from the
         # start
-        if self.DEBUG:
-            log.debug("checking prefixes")
+        if self.INFO:
+            write_log(release_id, 'info', "checking prefixes")
         for i in range(
                 0, 5):  # in case of multiple levels
             mb = p2.sub('', p1.sub('', mb)).strip()
@@ -6862,8 +6668,8 @@ class PartLevels():
             for prefix in removewords:
                 if prefix[0] != " ":
                     prefix2 = unicode(prefix).lower().lstrip()
-                    if self.DEBUG:
-                        log.debug("checking prefix %s", prefix2)
+                    if self.INFO:
+                        write_log(release_id, 'info', "checking prefix %s", prefix2)
                     if mb.lower().startswith(prefix2):
                         mb = mb[len(prefix2):]
                     if ti.lower().startswith(prefix2):
@@ -6871,13 +6677,9 @@ class PartLevels():
             mb = mb.strip()
             ti = ti.strip()
             if self.INFO:
-                log.info(
-                    "pairs after prefix strip iteration %s. mb = %s, ti = %s",
-                    i,
-                    mb,
-                    ti)
-        if self.DEBUG:
-            log.debug("Prefixes checked")
+                write_log(release_id, 'info', "pairs after prefix strip iteration %s. mb = %s, ti = %s", i, mb, ti)
+        if self.INFO:
+            write_log(release_id, 'info', "Prefixes checked")
 
         #  replacements
         strreps = self.options[track]["cwp_replacements"].split('/')
@@ -6890,16 +6692,12 @@ class PartLevels():
                 tupr = tuple(tupr)
                 replacements.append(tupr)
             else:
-                if self.ERROR:
-                    log.error(
-                        'Error in replacement format for replacement %s', rep)
-                self.append_tag(
-                    tm,
-                    '~cwp_error',
-                    '6. Error in replacement format for replacement ' +
-                    rep)
+                if self.ERROR or self.INFO:
+                    write_log(release_id, 'error', 'Error in replacement format for replacement %s', rep)
+                self.append_tag(release_id, tm, '~cwp_error', '6. Error in replacement format for replacement ' +
+                                rep)
         if self.INFO:
-            log.info("Replacement: %s", replacements)
+            write_log(release_id, 'info', "Replacement: %s", replacements)
 
         #  synonyms
         strsyns = self.options[track]["cwp_synonyms"].split('/')
@@ -6910,24 +6708,19 @@ class PartLevels():
                 for i, ts in enumerate(tup):
                     tup[i] = ts.strip("' ").strip('"')
                     if not tup[i]:
-                        if self.ERROR:
-                            log.error(
-                                'Synonym entries must not be blank - error in %s', syn)
-                        self.append_tag(
-                            tm,
-                            '~cwp_error',
-                            '7. Synonym entries must not be blank - error in ' +
-                            syn)
+                        if self.ERROR or self.INFO:
+                            write_log(release_id, 'error', 'Synonym entries must not be blank - error in %s', syn)
+                        self.append_tag(release_id, tm, '~cwp_error',
+                                        '7. Synonym entries must not be blank - error in ' +
+                                        syn)
                         tup[i] = "**BAD**"
                     elif re.findall(r'[^\w|\&]+', tup[i], re.UNICODE):
-                        if self.ERROR:
-                            log.error(
-                                'Synonyms must be single words without punctuation - error in %s', syn)
-                        self.append_tag(
-                            tm,
-                            '~cwp_error',
-                            '7. Synonyms must be single words without punctuation - error in ' +
-                            syn)
+                        if self.ERROR or self.INFO:
+                            write_log(release_id, 'error',
+                                      'Synonyms must be single words without punctuation - error in %s', syn)
+                        self.append_tag(release_id, tm, '~cwp_error',
+                                        '7. Synonyms must be single words without punctuation - error in ' +
+                                        syn)
                         tup[i] = "**BAD**"
                 if "**BAD**" in tup:
                     continue
@@ -6935,38 +6728,33 @@ class PartLevels():
                     tup = tuple(tup)
                     synonyms.append(tup)
             else:
-                if self.ERROR:
-                    log.error('Error in synonmym format for synonym %s', syn)
-                self.append_tag(
-                    tm,
-                    '~cwp_error',
-                    '7. Error in synonym format for synonym ' +
-                    syn)
+                if self.ERROR or self.INFO:
+                    write_log(release_id, 'error', 'Error in synonmym format for synonym %s', syn)
+                self.append_tag(release_id, tm, '~cwp_error', '7. Error in synonym format for synonym ' +
+                                syn)
         if self.INFO:
-            log.info("Synonyms: %s", synonyms)
+            write_log(release_id, 'info', "Synonyms: %s", synonyms)
 
         # fix replacements and synonyms
-
         for key, equiv in replacements:
             if self.INFO:
-                log.info("key %s, equiv %s", key, equiv)
-            esc_key = re.escape(key)
-            key_pattern = '\\b' + esc_key + '\\b'
+                write_log(release_id, 'info', "key %s, equiv %s", key, equiv)
+            if key[0] == "!" and key[1] == "!" and key[-1] == "!" and key[-2] == "!":  # we have a reg ex inside {{ }}
+                key_pattern = key[2:-2]
+            else:
+                esc_key = re.escape(key)
+                key_pattern = '\\b' + esc_key + '\\b'
             ti = re.sub(key_pattern, equiv, ti)
-            if self.DEBUG:
-                log.debug(
-                    "Replaced replacements, ti = %s", ti)
+            if self.INFO:
+                write_log(release_id, 'info', "Replaced replacements, ti = %s", ti)
         # Replace Roman numerals as per synonyms
         ti_test = replace_roman_numerals(ti)
         mb_test = replace_roman_numerals(mb)
         if self.INFO:
-            log.info(
-                'Replaced Roman numerals. mb_test = %s, ti_test = %s',
-                mb_test,
-                ti_test)
+            write_log(release_id, 'info', 'Replaced Roman numerals. mb_test = %s, ti_test = %s', mb_test, ti_test)
         for key, equiv in synonyms:
             if self.INFO:
-                log.info("key %s, equiv %s", key, equiv)
+                write_log(release_id, 'info', "key %s, equiv %s", key, equiv)
             # mark the equivalents so that they can be reversed later
             esc_equiv = re.escape(equiv)
             equiv_pattern = '\\b' + esc_equiv + '\\b'
@@ -6989,68 +6777,55 @@ class PartLevels():
             ti_test = re.sub(key_pattern, syno, ti_test,
                              re.IGNORECASE | re.UNICODE)
             # better than ti_test = ti_test.replace(key, equiv)
-            if self.DEBUG:
-                log.debug(
-                    "Replaced synonyms mb_test = %s, ti_test = %s",
-                    mb_test,
-                    ti_test)
+            if self.INFO:
+                write_log(release_id, 'info', "Replaced synonyms mb_test = %s, ti_test = %s", mb_test, ti_test)
 
         # check if the title item is wholly part of the mb item
 
-        if self.DEBUG:
-            log.debug(
-                "Testing if ti in mb. ti_test = %s, mb_test = %s",
-                ti_test,
-                mb_test)
-        nopunc_ti = self.boil(ti_test)
         if self.INFO:
-            log.info("nopunc_ti =%s", nopunc_ti)
-        nopunc_mb = self.boil(mb_test)
+            write_log(release_id, 'info', "Testing if ti in mb. ti_test = %s, mb_test = %s", ti_test, mb_test)
+        nopunc_ti = self.boil(release_id, ti_test)
         if self.INFO:
-            log.info("nopunc_mb =%s", nopunc_mb)
+            write_log(release_id, 'info', "nopunc_ti =%s", nopunc_ti)
+        nopunc_mb = self.boil(release_id, mb_test)
+        if self.INFO:
+            write_log(release_id, 'info', "nopunc_mb =%s", nopunc_mb)
         ti_len = len(nopunc_ti)
         if self.INFO:
-            log.info("ti len %s", ti_len)
+            write_log(release_id, 'info', "ti len %s", ti_len)
         sub_len = int(ti_len)
         if self.INFO:
-            log.info("sub len %s", sub_len)
-        if self.DEBUG:
-            log.debug(
-                "Initial test. nopunc_mb = %s, nopunc_ti = %s, sub_len = %s",
-                nopunc_mb,
-                nopunc_ti,
-                sub_len)
-        if self.DEBUG:
-            log.debug("test sub....")
+            write_log(release_id, 'info', "sub len %s", sub_len)
+        if self.INFO:
+            write_log(release_id, 'info', "Initial test. nopunc_mb = %s, nopunc_ti = %s, sub_len = %s", nopunc_mb,
+                      nopunc_ti, sub_len)
+        if self.INFO:
+            write_log(release_id, 'info', "test sub....")
         lcs = longest_common_substring(nopunc_mb, nopunc_ti)['string']
         if self.INFO:
-            log.info(
-                "Longest common substring is: %s. Sub_len is %s",
-                lcs,
-                sub_len)
+            write_log(release_id, 'info', "Longest common substring is: %s. Sub_len is %s", lcs, sub_len)
         if len(lcs) >= sub_len:
             return None
 
         # try and strip the canonical item from the title item (only a full
         # strip affects the outcome)
         if len(nopunc_mb) > 0:
-            ti_new = self.strip_parent_from_work(ti_test, mb_test, 0, False)[0]
+            ti_new = self.strip_parent_from_work(release_id, ti_test, mb_test, 0, False)[0]
             if ti_new == ti_test:
                 mb_list = re.split(
                     r';\s|:\s|\.\s|\-\s',
                     mb_test,
                     self.options[track]["cwp_granularity"])
-                if self.DEBUG:
-                    log.debug("mb_list = %s", mb_list)
+                if self.INFO:
+                    write_log(release_id, 'info', "mb_list = %s", mb_list)
                 if mb_list:
                     for mb_bit in mb_list:
-                        ti_new = self.strip_parent_from_work(
-                            ti_new, mb_bit, 0, False)[0]
-                        if self.DEBUG:
-                            log.debug("MB_BIT: %s, TI_NEW: %s", mb_bit, ti_new)
+                        ti_new = self.strip_parent_from_work(release_id, ti_new, mb_bit, 0, False)[0]
+                        if self.INFO:
+                            write_log(release_id, 'info', "MB_BIT: %s, TI_NEW: %s", mb_bit, ti_new)
             else:
                 if len(ti_new) > 0:
-                    return self.reverse_syn(ti_new, synonyms)
+                    return self.reverse_syn(release_id, ti_new, synonyms)
                 else:
                     return None
             if len(ti_new) == 0:
@@ -7072,11 +6847,8 @@ class PartLevels():
             "la",
             "le"]
         # TODO Parameterize this?
-        if self.DEBUG:
-            log.debug(
-                "Check before splitting: mb_test = %s, ti_test = %s",
-                mb_test,
-                ti_test)
+        if self.INFO:
+            write_log(release_id, 'info', "Check before splitting: mb_test = %s, ti_test = %s", mb_test, ti_test)
         ti_list = re.findall(r"\b\w+?\b|\B\&\B", ti, re.UNICODE)
         # allow ampersands and non-latin characters as word characters
         ti_list_punc = re.findall(r"[^\w|\&]+", ti, re.UNICODE)
@@ -7094,9 +6866,9 @@ class PartLevels():
         # be synonyms which are each one word
         mb_list2 = re.findall(r"\b\w+?\b|\B\&\B", mb_test, re.UNICODE)
         for index, mb_bit2 in enumerate(mb_list2):
-            mb_list2[index] = self.boil(mb_bit2)
-            if self.DEBUG:
-                log.debug("mb_list2[%s] = %s", index, mb_list2[index])
+            mb_list2[index] = self.boil(release_id, mb_bit2)
+            if self.INFO:
+                write_log(release_id, 'info', "mb_list2[%s] = %s", index, mb_list2[index])
         ti_new = []
         ti_comp_list = []
         ti_rich_list = []
@@ -7109,15 +6881,11 @@ class PartLevels():
             else:
                 ti_bit = ('', '')
             if self.INFO:
-                log.info(
-                    "i = %s, ti_bit_test = %s, ti_bit = %s",
-                    i,
-                    ti_bit_test,
-                    ti_bit)
+                write_log(release_id, 'info', "i = %s, ti_bit_test = %s, ti_bit = %s", i, ti_bit_test, ti_bit)
             # Boolean to indicate whether ti_bit is a new word
             ti_rich_list.append((ti_bit, True))
             if not ti_bit_test or (
-                    ti_bit_test and self.boil(ti_bit_test) in mb_list2):
+                    ti_bit_test and self.boil(release_id, ti_bit_test) in mb_list2):
                 if ti_bit_test:
                     words += 1
                 ti_rich_list[i] = (ti_bit, False)
@@ -7126,14 +6894,12 @@ class PartLevels():
                         r'\w', ti_bit[0], re.UNICODE):
                     ti_comp_list.append(ti_bit[0])
         if self.INFO:
-            log.info("words %s", words)
+            write_log(release_id, 'info', "words %s", words)
         if self.INFO:
-            log.info("ti_comp_list = %s", ti_comp_list)
+            write_log(release_id, 'info', "ti_comp_list = %s", ti_comp_list)
         if self.INFO:
-            log.info(
-                "ti_rich_list before removing singletons = %s. length = %s",
-                ti_rich_list,
-                len(ti_rich_list))
+            write_log(release_id, 'info', "ti_rich_list before removing singletons = %s. length = %s", ti_rich_list,
+                      len(ti_rich_list))
         s = 0
         index = 0
         change = ()
@@ -7147,30 +6913,28 @@ class PartLevels():
                 # ignore singleton new words in middle of title
                 ti_rich_list[index] = (change, False)
                 s = 0
-        if self.DEBUG:
-            log.debug(
-                "ti_rich_list before gapping = %s. length = %s",
-                ti_rich_list,
-                len(ti_rich_list))
+        if self.INFO:
+            write_log(release_id, 'info', "ti_rich_list before gapping = %s. length = %s", ti_rich_list,
+                      len(ti_rich_list))
         if s > 0:
             p = self.options[track]["cwp_proximity"]
             d = self.options[track]["cwp_proximity"] - \
                 self.options[track]["cwp_end_proximity"]
             for i, (ti_bit, new) in enumerate(ti_rich_list):
                 if not new:
-                    if self.DEBUG:
-                        log.debug("%s not new. p = %s", ti_bit, p)
+                    if self.INFO:
+                        write_log(release_id, 'info', "%s not new. p = %s", ti_bit, p)
                     if p > 0:
                         for j in range(0, p + 1):
-                            if self.DEBUG:
-                                log.debug("i = %s, j = %s", i, j)
+                            if self.INFO:
+                                write_log(release_id, 'info', "i = %s, j = %s", i, j)
                             if i + j < len(ti_rich_list):
                                 if ti_rich_list[i + j][1]:
-                                    if self.DEBUG:
-                                        log.debug("Set to true..")
+                                    if self.INFO:
+                                        write_log(release_id, 'info', "Set to true..")
                                     ti_rich_list[i] = (ti_bit, True)
-                                    if self.DEBUG:
-                                        log.debug("...set OK")
+                                    if self.INFO:
+                                        write_log(release_id, 'info', "...set OK")
                             else:
                                 if j <= p - d:
                                     ti_rich_list[i] = (ti_bit, True)
@@ -7178,8 +6942,8 @@ class PartLevels():
                     p = self.options[track]["cwp_proximity"]
                 if not ti_rich_list[i][1]:
                     p -= 1
-        if self.DEBUG:
-            log.debug("ti_rich_list after gapping = %s", ti_rich_list)
+        if self.INFO:
+            write_log(release_id, 'info', "ti_rich_list after gapping = %s", ti_rich_list)
         nothing_new = True
         for (ti_bit, new) in ti_rich_list:
             if new:
@@ -7191,11 +6955,11 @@ class PartLevels():
         else:
             new_prev = False
             for i, (ti_bit, new) in enumerate(ti_rich_list):
-                if self.DEBUG:
-                    log.debug("Create new for %s?", ti_bit)
+                if self.INFO:
+                    write_log(release_id, 'info', "Create new for %s?", ti_bit)
                 if new:
-                    if self.DEBUG:
-                        log.debug("Yes for %s", ti_bit)
+                    if self.INFO:
+                        write_log(release_id, 'info', "Yes for %s", ti_bit)
                     if not new_prev:
                         if i > 0:
                             # check to see if the last char of the prev
@@ -7214,45 +6978,41 @@ class PartLevels():
                             ti_new.append(ti_bit[1])
                     else:
                         ti_new.append(ti_bit[1])
-                    if self.DEBUG:
-                        log.debug(
-                            "appended %s. ti_new is now %s", ti_bit, ti_new)
+                    if self.INFO:
+                        write_log(release_id, 'info', "appended %s. ti_new is now %s", ti_bit, ti_new)
                 else:
-                    if self.DEBUG:
-                        log.debug("Not for %s", ti_bit)
+                    if self.INFO:
+                        write_log(release_id, 'info', "Not for %s", ti_bit)
                     if new != new_prev:
                         ti_new.append(u'\u2026 ')
 
                 new_prev = new
         if ti_new:
             if self.INFO:
-                log.info("ti_new %s", ti_new)
+                write_log(release_id, 'info', "ti_new %s", ti_new)
             ti = ''.join(ti_new)
             if self.INFO:
-                log.info("New text from title = %s", ti)
+                write_log(release_id, 'info', "New text from title = %s", ti)
         else:
             if self.INFO:
-                log.info("New text empty")
+                write_log(release_id, 'info', "New text empty")
             return None
         # see if there is any significant difference between the strings
         if ti:
-            nopunc_ti = self.boil(ti)
-            nopunc_mb = self.boil(mb)
+            nopunc_ti = self.boil(release_id, ti)
+            nopunc_mb = self.boil(release_id, mb)
             ti_len = len(nopunc_ti)
             sub_len = ti_len * \
                 float(self.options[track]["cwp_substring_match"]) / 100
-            if self.DEBUG:
-                log.debug("test sub....")
+            if self.INFO:
+                write_log(release_id, 'info', "test sub....")
             lcs = longest_common_substring(nopunc_mb, nopunc_ti)['string']
             if self.INFO:
-                log.info(
-                    "Longest common substring is: %s. Threshold length is %s",
-                    lcs,
-                    sub_len)
+                write_log(release_id, 'info', "Longest common substring is: %s. Threshold length is %s", lcs, sub_len)
             if len(lcs) >= sub_len:
                 return None
-            if self.DEBUG:
-                log.debug("...done, ti =%s", ti)
+            if self.INFO:
+                write_log(release_id, 'info', "...done, ti =%s", ti)
         # remove duplicate successive words (and remove first word of title
         # item if it duplicates last word of mb item)
         if ti:
@@ -7263,28 +7023,27 @@ class PartLevels():
                 if ti_bit != "...":
 
                     if i > 1:
-                        if self.boil(ti_bit) == self.boil(ti_bit_prev):
+                        if self.boil(release_id, ti_bit) == self.boil(release_id, ti_bit_prev):
                             dup = ti_list_new.pop(i)
-                            if self.DEBUG:
-                                log.debug("...removed dup %s", dup)
+                            if self.INFO:
+                                write_log(release_id, 'info', "...removed dup %s", dup)
 
                 ti_bit_prev = ti_bit
 
             if self.INFO:
-                log.info("1st word of ti = %s. Last word of mb = %s",
-                         ti_list_new[0], mb_list2[-1])
+                write_log(release_id, 'info', "1st word of ti = %s. Last word of mb = %s", ti_list_new[0], mb_list2[-1])
             if ti_list_new and mb_list2:
-                if self.boil(ti_list_new[0]) == mb_list2[-1]:
-                    if self.DEBUG:
-                        log.debug("Removing 1st word from ti...")
+                if self.boil(release_id, ti_list_new[0]) == mb_list2[-1]:
+                    if self.INFO:
+                        write_log(release_id, 'info', "Removing 1st word from ti...")
                     first = ti_list_new.pop(0)
-                    if self.DEBUG:
-                        log.debug("...removed %s", first)
+                    if self.INFO:
+                        write_log(release_id, 'info', "...removed %s", first)
             else:
                 return None
             if ti_list_new:
-                if self.DEBUG:
-                    log.debug("rejoin list %s", ti_list_new)
+                if self.INFO:
+                    write_log(release_id, 'info', "rejoin list %s", ti_list_new)
                 ti = ' '.join(ti_list_new)
             else:
                 return None
@@ -7295,8 +7054,8 @@ class PartLevels():
                 ti = ti.strip('"')
             if ti.count("'") == 1:
                 ti = ti.strip("'")
-            if self.DEBUG:
-                log.debug("stripped punc ok. ti = %s", ti)
+            if self.INFO:
+                write_log(release_id, 'info', "stripped punc ok. ti = %s", ti)
             if ti:
                 if ti.count("\"") == 1:
                     ti = ti.strip("\"")
@@ -7320,23 +7079,25 @@ class PartLevels():
                 for char_pair in match_chars:
                     if char_pair[0] == ti[0] and char_pair[1] == ti[last]:
                         ti = ti.lstrip(char_pair[0]).rstrip(char_pair[1])
-        if self.DEBUG:
-            log.debug("DIFF is returning ti = %s", ti)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "DIFF_PAIR is returning ti = %s", ti)
         if ti and len(ti) > 0:
-            return self.reverse_syn(ti, synonyms)
+            return self.reverse_syn(release_id, ti, synonyms)
         else:
             return None
 
-    def reverse_syn(self, term, synonyms):
+    def reverse_syn(self, release_id, term, synonyms):
         """
         reverse any synonyms left in the tititle item
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param term: the title item
         :param synonyms: tuples
         :return: title item without synonyms
         """
         for key, equiv in synonyms:
             if self.INFO:
-                log.info("key %s, equiv %s", key, equiv)
+                write_log(release_id, 'info', "key %s, equiv %s", key, equiv)
             equiv = self.EQ + equiv
             esc_equiv = re.escape(equiv)
             equiv_pattern = '\\b' + esc_equiv + '\\b'
@@ -7344,14 +7105,16 @@ class PartLevels():
             term = term.replace(self.EQ, '')
         return term
 
-    def boil(self, s):
+    def boil(self, release_id, s):
         """
         Remove punctuation, spaces, capitals and accents for string comparisons
+        :param release_id: name for log file - usually =musicbrainz_albumid
+        unless called outside metadata processor
         :param s:
         :return:
         """
-        if self.DEBUG:
-            log.debug("boiling %s", s)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "boiling %s", s)
         s = s.lower()
         if isinstance(s, str):
             s = s.decode('unicode_escape')
@@ -7372,14 +7135,14 @@ class PartLevels():
                 'NFD',
                 s) if unicodedata.category(c) != 'Mn')
         boiled = punc.sub('', s).strip().lower().rstrip("s'")
-        if self.DEBUG:
-            log.debug("boiled result = %s", boiled)
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "boiled result = %s", boiled)
         return boiled
 
     # Remove certain keywords
-    def remove_words(self, query, stopwords):
-        if self.DEBUG:
-            log.debug("INSIDE REMOVE_WORDS")
+    def remove_words(self, release_id, query, stopwords):
+        if self.DEBUG or self.INFO:
+            write_log(release_id, 'debug', "INSIDE REMOVE_WORDS")
         querywords = query.split()
         resultwords = []
         for word in querywords:
@@ -7402,7 +7165,7 @@ class ClassicalExtrasOptionsPage(OptionsPage):
            plugin_options('workparts') + plugin_options('genres') + plugin_options('other')
 
     options = []
-
+    # custom logging for non-album-related messages is written to startup.log
     for opt in opts:
         if 'type' in opt:
             if 'default' in opt:
@@ -7416,9 +7179,7 @@ class ClassicalExtrasOptionsPage(OptionsPage):
             elif opt['type'] == 'Integer':
                 options.append(IntOption("setting", opt['option'], default))
             else:
-                log.error(
-                    "Error in setting options for option = %s",
-                    opt['option'])
+                write_log("session", 'error', "Error in setting options for option = %s", opt['option'])
 
     def __init__(self, parent=None):
         super(ClassicalExtrasOptionsPage, self).__init__(parent)
@@ -7472,9 +7233,7 @@ class ClassicalExtrasOptionsPage(OptionsPage):
                 self.ui.__dict__[ui_name].setValue(
                     self.config.setting[opt['option']])
             else:
-                log.error(
-                    "Error in loading options for option = %s",
-                    opt['option'])
+                write_log('session', 'error', "Error in loading options for option = %s", opt['option'])
 
     def save(self):
         opts = plugin_options('artists') + plugin_options('tag') + \
@@ -7503,9 +7262,7 @@ class ClassicalExtrasOptionsPage(OptionsPage):
                 self.config.setting[opt['option']
                                     ] = self.ui.__dict__[ui_name].value()
             else:
-                log.error(
-                    "Error in saving options for option = %s",
-                    opt['option'])
+                write_log('session', 'error', "Error in saving options for option = %s", opt['option'])
 
 
 #################
@@ -7515,25 +7272,30 @@ class ClassicalExtrasOptionsPage(OptionsPage):
 # set defaults for certain options that MUST be manually changed by the
 # user each time they are to be over-ridden
 config.setting['use_cache'] = True
-config.setting['log_debug'] = False
-config.setting['log_info'] = False
 config.setting['ce_options_overwrite'] = False
 config.setting['track_ars'] = True
 config.setting['release_ars'] = True
-
-REF_DICT = get_references_from_file(config.setting['cwp_muso_path'], config.setting['cwp_muso_refdb'])
+# custom logging for non-album-related messages is written to startup.log
+write_log('session', 'basic', 'Loading ' + PLUGIN_NAME)
+REF_DICT = get_references_from_file('session',
+                                    config.setting['cwp_muso_path'], config.setting['cwp_muso_refdb'])
+write_log('session', 'info', 'External references (Muso):')
+write_log('session', 'info', REF_DICT)
 COMPOSER_DICT = REF_DICT['composers']
 if config.setting['cwp_muso_classical'] and not COMPOSER_DICT:
-    log.error('No composer roster found')
+    write_log('session', 'error', 'No composer roster found')
 for cd in COMPOSER_DICT:
     cd['lc_name'] = [c.lower() for c in cd['name']]
     cd['lc_sort'] = [c.lower() for c in cd['sort']]
 PERIOD_DICT = REF_DICT['periods']
 if (config.setting['cwp_muso_dates'] or config.setting['cwp_muso_periods']) and not PERIOD_DICT:
-    log.error('No period map found')
+    write_log('session', 'error', 'No period map found')
 GENRE_DICT = REF_DICT['genres']
 if config.setting['cwp_muso_genres'] and not GENRE_DICT:
-    log.error('No classical genre list found')
+    write_log('session', 'error', 'No classical genre list found')
 register_track_metadata_processor(PartLevels().add_work_info)
 register_track_metadata_processor(ExtraArtists().add_artist_info)
 register_options_page(ClassicalExtrasOptionsPage)
+write_log('session', 'basic', 'Finished intialisation')
+# config.setting['log_debug'] = False
+# config.setting['log_info'] = False
